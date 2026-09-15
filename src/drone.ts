@@ -23,6 +23,7 @@ export class Drone {
   rollRate = 0;
   alive = true;
   crashCount = 0;
+  bumpCount = 0;
   lastCrashAt = -10;
 
   /** Manual override nudge (WASD), decayed over time. */
@@ -65,8 +66,8 @@ export class Drone {
 
     if (this.pos.y < WORLD.groundY + 0.25) {
       this.pos.y = WORLD.groundY + 0.25;
-      if (this.vel.y < -6) this.crash("ground"); // only hard slams count
-      this.vel.y = Math.max(0, this.vel.y);
+      this.bumpCount++;
+      this.vel.y = Math.abs(this.vel.y) * 0.4; // soft bounce
       this.vel.multiplyScalar(0.92);
     }
     if (this.pos.y > WORLD.ceilingY) {
@@ -75,11 +76,15 @@ export class Drone {
     }
   }
 
+  /** Soft collision: counted, never fatal (explore mode). */
+  bump(): void {
+    this.bumpCount++;
+  }
+
   crash(kind: string): void {
     this.crashCount++;
+    this.bumpCount++;
     this.lastCrashAt = performance.now() / 1000;
-    this.alive = false;
-    setTimeout(() => this.respawn(), 1600);
     console.warn(`[drone] ${kind} impact #${this.crashCount}`);
   }
 

@@ -3,7 +3,7 @@ import type { CircuitPayload } from "./types";
 import { FlyBrain } from "./brain";
 import { FlyVision } from "./vision";
 import { Drone, WORLD } from "./drone";
-import { buildScene, checkCollision, clearanceAhead } from "./world";
+import { buildScene, checkCollision, resolveCollision, clearanceAhead } from "./world";
 
 let renderer: THREE.WebGLRenderer;
 let scene: THREE.Scene;
@@ -63,6 +63,7 @@ async function init(): Promise<void> {
 }
 
 let last = performance.now();
+let launchTime = performance.now();
 const traceHist: { avert: number; steer: number; lift: number; thr: number }[] = [];
 
 function loop(now: number): void {
@@ -103,9 +104,26 @@ function loop(now: number): void {
 
   drone.step(cmd, dt);
 
-  // collisions
+  // collisions: soft bump + bounce (explore mode - no restarts).
+  // Escape-saccade cooldown bumps the brain so it picks a new heading.
   if (checkCollision(drone.pos)) {
-    drone.crash("obstacle");
+    if (resolveCollision(drone.pos, drone.vel)) {
+      drone.bumpCount++;
+      brain.notifyBump();
+    }
+  }
+
+  // keep inside the world bounds (perimeter walls): slide along them
+  const LIM = 480;
+  if (Math.abs(drone.pos.x) > LIM) {
+    drone.pos.x = Math.sign(drone.pos.x) * LIM;
+    drone.vel.x *= -0.5;
+    brain.notifyBump();
+  }
+  if (Math.abs(drone.pos.z) > LIM) {
+    drone.pos.z = Math.sign(drone.pos.z) * LIM;
+    drone.vel.z *= -0.5;
+    brain.notifyBump();
   }
 
   // chase camera
@@ -131,14 +149,16 @@ function loop(now: number): void {
   const clr = clearanceAhead(drone.pos, drone.yaw);
   bar("bar-clr", 1 - clr / 60);
   el("val-clr").textContent = `${clr.toFixed(0)}m`;
-  el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : "CONNECTOME";
+  el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : "EXPLORE · CONNECTOME";
   el("mode-badge").style.color = manual ? "#ffb347" : "#7cf7ff";
 
+  const flightTime = (performance.now() - launchTime) / 1000;
   el("pop-stats").innerHTML =
     `<div>avert pool <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b></div>` +
     `<div>steer pool <b style="color:#7cf7ff">${cmd.pools.steer >= 0 ? "+" : ""}${cmd.pools.steer.toFixed(2)}</b></div>` +
     `<div>lift pool <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>` +
-    `<div style="opacity:0.6;margin-top:4px">crashes: ${drone.crashCount} · z: ${drone.pos.z.toFixed(0)}m</div>`;
+    `<div style="opacity:0.6;margin-top:4px">airtime ${flightTime.toFixed(0)}s · bumps ${drone.bumpCount} · ` +
+    `pos ${drone.pos.x.toFixed(0)}, ${drone.pos.z.toFixed(0)}m</div>`;
 
   traceHist.push({ avert: cmd.pools.avert, steer: cmd.pools.steer, lift: cmd.pools.lift, thr: cmd.throttle });
   if (traceHist.length > 150) traceHist.shift();

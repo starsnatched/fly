@@ -104,6 +104,23 @@ export function buildScene(): THREE.Scene {
     z -= 16 + rnd() * 22;
   }
 
+  // sparse pillar scatter across the whole field so open-world exploration
+  // always has something on the horizon
+  for (let i = 0; i < 420; i++) {
+    const x = (rnd() - 0.5) * 900;
+    const zz = (rnd() - 0.5) * 900;
+    // keep the course strip itself as generated (skip if inside it)
+    if (Math.abs(x) < 40 && zz < 10) continue;
+    const r = 1.5 + rnd() * 5;
+    const h = 5 + rnd() * 20;
+    const m = new THREE.Mesh(
+      new THREE.CylinderGeometry(r, r * 1.15, h, 9),
+      rnd() < 0.5 ? pillarMat : pillarMat2,
+    );
+    m.position.set(x, h / 2, zz);
+    addObstacleMesh(m, r * 1.15, h);
+  }
+
   // edge outlines for readability
   const meshes: THREE.Mesh[] = [];
   group.traverse((o) => {
@@ -141,6 +158,36 @@ export function checkCollision(pos: THREE.Vector3): boolean {
     if (dx * dx + dz * dz < rr * rr) return true;
   }
   return false;
+}
+
+/**
+ * Push the drone out of any obstacle it penetrates and bounce it off
+ * (soft bump, not death). Returns true if a bump occurred.
+ */
+export function resolveCollision(pos: THREE.Vector3, vel: THREE.Vector3): boolean {
+  let bumped = false;
+  for (const o of obstacles) {
+    if (pos.y > o.h + 0.1) continue;
+    const dx = pos.x - o.x;
+    const dz = pos.z - o.z;
+    const dist = Math.hypot(dx, dz);
+    const rr = o.r + 0.45;
+    if (dist >= rr) continue;
+    // push out along the radial normal (or +x if dead center)
+    const nx = dist > 1e-4 ? dx / dist : 1;
+    const nz = dist > 1e-4 ? dz / dist : 0;
+    pos.x = o.x + nx * rr;
+    pos.z = o.z + nz * rr;
+    // reflect velocity with damping (restitution 0.35)
+    const vn = vel.x * nx + vel.z * nz;
+    if (vn < 0) {
+      vel.x -= 1.35 * vn * nx;
+      vel.z -= 1.35 * vn * nz;
+    }
+    vel.multiplyScalar(0.72);
+    bumped = true;
+  }
+  return bumped;
 }
 
 /** Nearest obstacle surface distance within a forward cone (HUD "clear"). */

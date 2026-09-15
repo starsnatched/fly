@@ -81,6 +81,18 @@ export class FlyBrain {
     this.synapseTotal = payload.popMatrix.reduce((s, m) => s + m[2], 0);
   }
 
+  /** Called when the body collides with something: immediate escape turn. */
+  notifyBump(): void {
+    if (!this.saccade.active && this.saccade.cooldown <= 0) {
+      this.saccade.active = true;
+      this.saccade.tLeft = 0.6;
+      this.saccade.dir = this.rng() < 0.5 ? -1 : 1;
+      this.saccade.cooldown = 1.0;
+    }
+    // also re-roll the wander heading so it doesn't grind along the obstacle
+    this.wanderBias = (this.rng() - 0.5) * 1.2;
+  }
+
   get populationCount(): number { return this.N; }
   get neuronCount(): number { return this.neuronCount_; }
   get edgeCount(): number { return this.edgeCount_; }
@@ -98,6 +110,18 @@ export class FlyBrain {
   private justEnded = false; // post-saccadic detection holdoff
   private justEndTimer = 0;
   private sinceSaccadeEnd = 99; // seconds since last saccade ended
+  // spontaneous exploration: mean-reverting random turn-bias + wander saccades
+  private wanderBias = 0; // OU process, rad/s of preferred yaw command
+  private wanderSaccadeTimer = 2 + Math.random() * 3;
+  private wanderSaccade = { active: false, dir: 1, tLeft: 0 };
+  private rng = () => {
+    // xorshift for reproducible-ish randomness without Math.random deps
+    this.rngState ^= this.rngState << 13;
+    this.rngState ^= this.rngState >>> 17;
+    this.rngState ^= this.rngState << 5;
+    return ((this.rngState >>> 0) % 100000) / 100000;
+  };
+  private rngState = 0x9e3779b9;
 
   step(inp: BrainInputs): BrainOutputs {
     const dt = Math.min(inp.dt, 0.05);
@@ -215,16 +239,37 @@ export class FlyBrain {
 
     // cruise forward; looming brakes the drone (flies stop at expansion)
     const pitch = clamp(-0.35 * (1 - 0.75 * loomMean) + saccPitch, -1, 0.1);
-    // course attraction: when unthreatened, gently steer back toward -Z
-    // (goal-driven navigation, like an odor/landmark cue in the real fly)
-    let headingErr = 0 - inp.heading;
-    while (headingErr > Math.PI) headingErr -= 2 * Math.PI;
-    while (headingErr < -Math.PI) headingErr += 2 * Math.PI;
-    const attract = clamp(0.9 * headingErr, -0.5, 0.5) * (1 - Math.min(1, loomMean * 3));
-    // yaw: saccade dominates; small-flow steering assists between threats
-    const yaw = clamp(saccYaw + 2.0 * dodge + 0.4 * steer + attract, -1, 1);
+
+    // --- spontaneous exploration (real flies turn saccades every ~2-5 s) ---
+    // OU process on turn bias: bias += (-bias/tau + sigma*noise) * dt
+    this.wanderBias += (-this.wanderBias / 2.5 + (this.rng() - 0.5) * 1.6) * dt;
+    this.wanderBias = clamp(this.wanderBias, -0.6, 0.6);
+    this.wanderSaccadeTimer -= dt;
+    let wanderYaw = 0, wanderRoll = 0;
+    if (this.wanderSaccade.active) {
+      this.wanderSaccade.tLeft -= dt;
+      const env = Math.min(1, this.wanderSaccade.tLeft / 0.4 + 0.3);
+      wanderYaw = this.wanderSaccade.dir * 1.1 * env;
+      wanderRoll = -this.wanderSaccade.dir * 0.7 * env;
+      if (this.wanderSaccade.tLeft <= 0) this.wanderSaccade.active = false;
+    } else if (this.wanderSaccadeTimer <= 0 && !this.saccade.active) {
+      this.wanderSaccade.active = true;
+      this.wanderSaccade.tLeft = 0.4;
+      this.wanderSaccade.dir = this.rng() < 0.5 ? -1 : 1;
+      this.wanderSaccadeTimer = 2 + this.rng() * 4;
+    }
+
+    // course attraction is replaced by the wander bias in explore mode;
+    // yaw: escape saccade dominates, then wander saccade, then drift
+    const yaw = clamp(
+      saccYaw + 2.0 * dodge + 0.4 * steer + wanderYaw + 1.2 * this.wanderBias,
+      -1, 1,
+    );
     // roll: bank into the turn
-    const roll = clamp(saccRoll - 1.8 * dodge - 0.7 * steer - 0.6 * attract, -1, 1);
+    const roll = clamp(
+      saccRoll - 1.8 * dodge - 0.7 * steer + wanderRoll - 0.8 * this.wanderBias,
+      -1, 1,
+    );
     const throttle = clamp(lift, 0, 1);
 
     this.debug = {
@@ -242,7 +287,9 @@ export class FlyBrain {
       saccading: this.saccade.active ? 1 : 0,
       saccDir: this.saccade.dir,
       dodge,
-      attract,
+      attract: 0,
+      wanderBias: this.wanderBias,
+      wanderSaccading: this.wanderSaccade.active ? 1 : 0,
       pitch,
     };
 

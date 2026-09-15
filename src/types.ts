@@ -1,25 +1,30 @@
-export interface CircuitNeuron {
-  id: number;
-  pop: string;
-  type: string;
-  side: string;
+import type { EyeStats } from "./shared";
+
+/** Sensory + body state handed to the controller each frame. */
+export interface BrainInputs {
+  stats: EyeStats;
+  /** height above ground (m) */
+  altitude: number;
+  /** vertical velocity m/s (positive = climbing) */
+  vy: number;
+  /** current heading (yaw, radians; 0 = -Z) */
+  heading: number;
+  speed: number;
+  dt: number;
 }
 
-export interface CircuitMeta {
-  dataset: string;
-  license: string;
-  maxHops: number;
-  minSynapseWeight: number;
-  populations: string[];
-}
-
-export interface CircuitPayload {
-  meta: CircuitMeta;
-  neurons: CircuitNeuron[];
-  /** [srcIdx, tgtIdx, synapseCount] into neurons[] */
-  edges: [number, number, number][];
-  /** [prePop, postPop, aggregatedSynapses] */
-  popMatrix: [string, string, number][];
+/** Flight commands emitted by the controller. */
+export interface BrainOutputs {
+  /** 0..1 vertical thrust */
+  throttle: number;
+  /** -1..1 nose down/up */
+  pitch: number;
+  /** -1..1 */
+  roll: number;
+  /** -1..1 yaw rate command */
+  yaw: number;
+  /** named descending-pool activations (telemetry) */
+  pools: { avert: number; steer: number; lift: number };
 }
 
 export interface LifPayload {
@@ -53,15 +58,4 @@ export interface EyeFlow {
   h: Float32Array; // GRID_W * GRID_H, positive = rightward motion
   v: Float32Array; // GRID_W * GRID_H, positive = upward motion
   lum: Float32Array; // current luminance grid
-}
-
-export interface DroneState {
-  x: number;
-  y: number;
-  z: number;
-  yaw: number;
-  pitch: number;
-  roll: number;
-  alive: boolean;
-  crashCount: number;
 }

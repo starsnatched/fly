@@ -1,11 +1,10 @@
-import type { LifPayload } from "./types";
-import type { BrainInputs, BrainOutputs } from "./brain";
+import type { LifPayload, BrainInputs, BrainOutputs } from "./types";
 import { LifNetwork, DEFAULT_PARAMS, type LifParams } from "./lif";
 import { SharedCircuit } from "./shared";
 
 /**
- * Spiking-LIF controller: same external interface as FlyBrain so main.ts
- * can hot-swap between the rate-based and spiking brains (B key).
+ * Spiking-LIF controller (the only brain): a leaky-integrator network over
+ * 20,461 individual neurons wired by the real MaleCNS connectome.
  *
  * Pool activations for command synthesis come from real per-neuron spike
  * rates in the LIF network; looming/saccade/wander/commands are shared.

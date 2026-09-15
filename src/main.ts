@@ -1,6 +1,5 @@
 import * as THREE from "three";
-import type { CircuitPayload, LifPayload } from "./types";
-import { FlyBrain } from "./brain";
+import type { LifPayload } from "./types";
 import { LifBrain } from "./lifbrain";
 import { FlyVision } from "./vision";
 import { Drone, WORLD } from "./drone";
@@ -10,10 +9,7 @@ let renderer: THREE.WebGLRenderer;
 let scene: THREE.Scene;
 let camera: THREE.PerspectiveCamera;
 let vision: FlyVision;
-let rateBrain: FlyBrain;
-let lifBrain: LifBrain | null = null;
-let useLif = false;
-let brain: FlyBrain | LifBrain;
+let brain: LifBrain;
 let drone: Drone;
 let manual = false;
 const keys = new Set<string>();
@@ -40,24 +36,11 @@ async function init(): Promise<void> {
   drone.yaw = 0; // body -Z = world -Z: face down the course
   void WORLD;
 
-  // load the connectome-derived circuits (rate + spiking)
-  const res = await fetch("/fly-circuit.json");
-  const payload = (await res.json()) as CircuitPayload;
-  rateBrain = new FlyBrain(payload);
-  brain = rateBrain;
+  // load the connectome-derived spiking circuit
+  const res = await fetch("/fly-lif.json");
+  const payload = (await res.json()) as LifPayload;
+  brain = new LifBrain(payload);
   vision = new FlyVision(renderer);
-
-  // LIF circuit loads in the background (adds ~5 MB)
-  fetch("/fly-lif.json")
-    .then((r) => r.json() as Promise<LifPayload>)
-    .then((lp) => {
-      lifBrain = new LifBrain(lp);
-      el("lif-status").textContent = `LIF ready (B to switch)`;
-      updateCircuitInfo();
-    })
-    .catch(() => {
-      el("lif-status").textContent = "LIF unavailable";
-    });
 
   updateCircuitInfo();
 
@@ -65,11 +48,6 @@ async function init(): Promise<void> {
     keys.add(e.key.toLowerCase());
     if (e.key.toLowerCase() === "c") manual = !manual;
     if (e.key.toLowerCase() === "r") drone.respawn();
-    if (e.key.toLowerCase() === "b" && lifBrain) {
-      useLif = !useLif;
-      brain = useLif ? lifBrain : rateBrain;
-      updateCircuitInfo();
-    }
   });
   window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
   window.addEventListener("resize", () => {
@@ -86,8 +64,9 @@ let last = performance.now();
 let launchTime = performance.now();
 const traceHist: { avert: number; steer: number; lift: number; thr: number }[] = [];
 
-function loop(now: number): void {
+function loop(): void {
   requestAnimationFrame(loop);
+  const now = performance.now();
   const dt = Math.min((now - last) / 1000, 0.06);
   last = now;
   if (!drone.alive) {
@@ -112,7 +91,7 @@ function loop(now: number): void {
     dt,
   });
   (window as unknown as { __flybrainDebug: Record<string, number> }).__flybrainDebug = brain.debug;
-  (window as unknown as { __lifBrain: LifBrain | null }).__lifBrain = lifBrain;
+  (window as unknown as { __lifBrain: LifBrain }).__lifBrain = brain;
 
   if (manual) {
     cmd.throttle = 0.55 + drone.nudge.fwd * 0;
@@ -126,7 +105,7 @@ function loop(now: number): void {
   drone.step(cmd, dt);
 
   // collisions: soft bump + bounce (explore mode - no restarts).
-  // Escape-saccade cooldown bumps the brain so it picks a new heading.
+  // Bumps notify the brain so it picks a new heading.
   if (checkCollision(drone.pos)) {
     if (resolveCollision(drone.pos, drone.vel)) {
       drone.bumpCount++;
@@ -170,33 +149,25 @@ function loop(now: number): void {
   const clr = clearanceAhead(drone.pos, drone.yaw);
   bar("bar-clr", 1 - clr / 60);
   el("val-clr").textContent = `${clr.toFixed(0)}m`;
-  el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : "EXPLORE · CONNECTOME";
+  el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : "EXPLORE · LIF";
   el("mode-badge").style.color = manual ? "#ffb347" : "#7cf7ff";
 
   const flightTime = (performance.now() - launchTime) / 1000;
-  let poolRows: string;
-  if (useLif && lifBrain) {
-    const net = lifBrain.network;
-    const gabaPct = Math.round((100 * net.inhibCount) / net.N);
-    const topGaba = net.populations
-      .map((p, i) => ({ p, f: net.gabaFraction[i] }))
-      .sort((a, b) => b.f - a.f)[0];
-    poolRows =
-      `<div>spikes/frame <b style="color:#ffd166">${lifBrain.debug.spikesThisFrame ?? 0}</b></div>` +
-      `<div>LPLC <b style="color:#ff7d6b">${(lifBrain.debug.lplcHz ?? 0).toFixed(1)}Hz</b> · LC <b style="color:#ff7d6b">${(lifBrain.debug.lcHz ?? 0).toFixed(1)}Hz</b></div>` +
-      `<div>T4 <b style="color:#7cf7ff">${(lifBrain.debug.t4Hz ?? 0).toFixed(1)}Hz</b> · T5 <b style="color:#7cf7ff">${(lifBrain.debug.t5Hz ?? 0).toFixed(1)}Hz</b></div>` +
-      `<div>avert <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b> · lift <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>` +
-      `<div style="opacity:0.75;margin-top:4px">GABAergic <b style="color:#c792ea">${gabaPct}%</b> (${net.inhibCount.toLocaleString()}) · peak ${topGaba.p} ${Math.round(100 * topGaba.f)}%</div>` +
-      `<div style="opacity:0.5">NT conf ${(net.meanNtConf * 100).toFixed(0)}% (45.7M T-bars)</div>`;
-  } else {
-    poolRows =
-      `<div>avert pool <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b></div>` +
-      `<div>steer pool <b style="color:#7cf7ff">${cmd.pools.steer >= 0 ? "+" : ""}${cmd.pools.steer.toFixed(2)}</b></div>` +
-      `<div>lift pool <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>`;
-  }
+  const net = brain.network;
+  const gabaPct = Math.round((100 * net.inhibCount) / net.N);
+  const topGaba = net.populations
+    .map((p, i) => ({ p, f: net.gabaFraction[i] }))
+    .sort((a, b) => b.f - a.f)[0];
+  const poolRows =
+    `<div>spikes/frame <b style="color:#ffd166">${brain.debug.spikesThisFrame ?? 0}</b></div>` +
+    `<div>LPLC <b style="color:#ff7d6b">${(brain.debug.lplcHz ?? 0).toFixed(1)}Hz</b> · LC <b style="color:#ff7d6b">${(brain.debug.lcHz ?? 0).toFixed(1)}Hz</b></div>` +
+    `<div>T4 <b style="color:#7cf7ff">${(brain.debug.t4Hz ?? 0).toFixed(1)}Hz</b> · T5 <b style="color:#7cf7ff">${(brain.debug.t5Hz ?? 0).toFixed(1)}Hz</b></div>` +
+    `<div>avert <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b> · lift <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>` +
+    `<div style="opacity:0.75;margin-top:4px">GABAergic <b style="color:#c792ea">${gabaPct}%</b> (${net.inhibCount.toLocaleString()}) · peak ${topGaba.p} ${Math.round(100 * topGaba.f)}%</div>` +
+    `<div style="opacity:0.5">NT conf ${(net.meanNtConf * 100).toFixed(0)}% (45.7M T-bars)</div>`;
   el("pop-stats").innerHTML = poolRows +
     `<div style="opacity:0.6;margin-top:4px">airtime ${flightTime.toFixed(0)}s · bumps ${drone.bumpCount} · ` +
-    `pos ${drone.pos.x.toFixed(0)}, ${drone.pos.z.toFixed(0)}m${lifBrain ? " · [B] brain" : ""}</div>`;
+    `pos ${drone.pos.x.toFixed(0)}, ${drone.pos.z.toFixed(0)}m</div>`;
 
   traceHist.push({ avert: cmd.pools.avert, steer: cmd.pools.steer, lift: cmd.pools.lift, thr: cmd.throttle });
   if (traceHist.length > 150) traceHist.shift();
@@ -210,14 +181,13 @@ function loop(now: number): void {
 }
 
 function updateCircuitInfo(): void {
-  const mode = useLif ? "SPIKING LIF" : "RATE";
   const syn = brain.synapses >= 1e6
     ? `${Math.round(brain.synapses / 1e6)}M`
     : `${Math.round(brain.synapses / 1e3)}k`;
   el("circuit-info").textContent =
-    `${mode}: ${brain.neuronCount.toLocaleString()} neurons / ${brain.edgeCount.toLocaleString()} connections / ` +
-    `${syn} synapses - MaleCNS v1.0 [r4]`;
-  el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : (useLif ? "EXPLORE · LIF" : "EXPLORE · CONNECTOME");
+    `SPIKING LIF: ${brain.neuronCount.toLocaleString()} neurons / ` +
+    `${brain.edgeCount.toLocaleString()} connections / ${syn} synapses - MaleCNS v1.0`;
+  el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : "EXPLORE · LIF";
 }
 
 function render(): void {
@@ -233,8 +203,8 @@ let rasterRows: RasterRow[] | null = null;
 let rasterCol = 0;
 
 function ensureRaster(): void {
-  if (rasterRows || !useLif || !lifBrain) return;
-  const net = lifBrain.network;
+  if (rasterRows || !brain) return;
+  const net = brain.network;
   rasterRows = RASTER_POPS.map((p) => {
     const popIdx = net.populations.indexOf(p);
     const neurons = popIdx >= 0
@@ -252,13 +222,8 @@ function drawRaster(): void {
   if (!ctx) return;
   ctx.fillStyle = "rgba(4, 8, 10, 0.85)";
   ctx.fillRect(0, 0, c.width, c.height);
-  if (!rasterRows || !useLif || !lifBrain) {
-    ctx.fillStyle = "rgba(150,190,170,0.4)";
-    ctx.font = "11px monospace";
-    ctx.fillText("switch to LIF brain with [B] to see spikes", 12, c.height / 2);
-    return;
-  }
-  const net = lifBrain.network;
+  if (!rasterRows || !brain) return;
+  const net = brain.network;
   // record this frame's spikes
   for (const row of rasterRows) {
     for (let k = 0; k < row.neurons.length; k++) {

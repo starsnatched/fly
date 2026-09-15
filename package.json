@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "extract-circuit": "python scripts/extract_circuit.py"
+    "extract-lif-circuit": "python scripts/extract_lif_circuit.py"
   },
   "dependencies": {
     "three": "^0.170.0"

@@ -1,14 +1,16 @@
 /**
- * Shared sensory-processing front-end used by both controllers:
+ * Shared sensory-processing front-end of the spiking controller:
  *  - looming detection (dark-silhouette growth vs adapted baseline)
  *  - escape-saccade state machine (with post-saccadic reset + holdoff)
  *  - spontaneous wander (OU turn-bias + spontaneous saccades)
  *  - command synthesis from descending-pool activations
  *
- * The rate-based brain (brain.ts) and the spiking LIF brain (lif.ts) both
- * compose this, so switching between them preserves flight behavior while
- * swapping where pool activations come from.
+ * The spiking LIF brain (src/lifbrain.ts + src/lif.ts) composes this.
  */
+
+import type { EyeFlow } from "./types";
+
+export type { EyeFlow };
 
 export interface EyeStats {
   flowH: { L: number; R: number; U: number; D: number };

@@ -81,14 +81,6 @@ export function buildScene(): THREE.Scene {
         mR.position.set(gapX + 24 + wR / 2, h / 2, z);
         addObstacleMesh(mR, wR / 2, h);
       }
-      for (const px of [gapX, gapX + 6]) {
-        const post = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.22, 0.22, h + 2, 6),
-          new THREE.MeshBasicMaterial({ color: 0x35f0b0 }),
-        );
-        post.position.set(px, (h + 2) / 2, z);
-        group.add(post);
-      }
     } else {
       // overhead beam forcing low flight + one support pillar
       const y = 5.5 + rnd() * 5;
@@ -128,13 +120,9 @@ export function buildScene(): THREE.Scene {
       meshes.push(o as THREE.Mesh);
     }
     if ((o as THREE.Mesh).isMesh && (o as THREE.Mesh).geometry instanceof THREE.CylinderGeometry) {
-      const g = o as THREE.Mesh;
-      if ((g.material as THREE.Material) !== (postMat() as THREE.Material)) meshes.push(g);
+      meshes.push(o as THREE.Mesh);
     }
   });
-  function postMat(): THREE.Material {
-    return new THREE.MeshBasicMaterial();
-  }
   for (const m of meshes) {
     const edges = new THREE.LineSegments(
       new THREE.EdgesGeometry(m.geometry, 25),

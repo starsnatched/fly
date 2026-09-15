@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import type { BrainOutputs } from "./brain";
+import type { BrainOutputs } from "./types";
 
 export const WORLD = {
   groundY: 0,

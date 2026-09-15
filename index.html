@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FlyBrain FPV — MaleCNS connectome drone</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: #05070c; }
+      #app { width: 100%; height: 100%; }
+      canvas { display: block; }
+      #hud {
+        position: fixed; inset: 0; pointer-events: none;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color: #c8e6c9;
+        text-shadow: 0 0 6px rgba(0, 255, 140, 0.35);
+      }
+      .panel {
+        position: absolute; padding: 10px 12px;
+        background: rgba(3, 10, 8, 0.55);
+        border: 1px solid rgba(60, 255, 160, 0.18);
+        border-radius: 8px; font-size: 11px; line-height: 1.55;
+        backdrop-filter: blur(3px);
+      }
+      #top-left { top: 14px; left: 14px; min-width: 210px; }
+      #top-right { top: 14px; right: 14px; text-align: right; }
+      #eye-views { bottom: 14px; left: 14px; display: flex; gap: 8px; }
+      #eye-views canvas {
+        width: 192px; height: 108px; border-radius: 4px;
+        border: 1px solid rgba(60, 255, 160, 0.25);
+        image-rendering: pixelated;
+      }
+      .eye-label { position: absolute; top: -20px; font-size: 10px; opacity: 0.75; }
+      #brain-traces { bottom: 14px; right: 14px; width: 300px; }
+      #brain-traces canvas { width: 100%; height: 110px; display: block; }
+      .hud-title { font-size: 10px; letter-spacing: 0.14em; opacity: 0.6; margin-bottom: 5px; text-transform: uppercase; }
+      .bar-row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+      .bar-label { width: 48px; opacity: 0.8; }
+      .bar-track { flex: 1; height: 5px; background: rgba(60, 255, 160, 0.12); border-radius: 3px; overflow: hidden; }
+      .bar-fill { height: 100%; background: linear-gradient(90deg, #1de9a0, #7cf7ff); border-radius: 3px; transition: width 80ms linear; }
+      .bar-val { width: 40px; text-align: right; opacity: 0.85; }
+      #mode-badge { color: #7cf7ff; }
+      #startup {
+        position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+        background: rgba(2, 4, 8, 0.92); z-index: 10; pointer-events: auto;
+        font-family: ui-monospace, Menlo, Consolas, monospace; color: #bfe8d2;
+        text-align: center; font-size: 13px; line-height: 1.8; cursor: pointer;
+      }
+      #startup .card { max-width: 620px; padding: 34px 40px; border: 1px solid rgba(60,255,160,0.25); border-radius: 12px; background: rgba(6, 14, 12, 0.8); }
+      #startup h1 { font-size: 18px; margin-bottom: 14px; color: #7cf7ff; letter-spacing: 0.06em; }
+      #startup .dim { opacity: 0.65; font-size: 11px; }
+      #startup .go { margin-top: 18px; color: #1de9a0; font-size: 14px; animation: pulse 1.6s infinite; }
+      @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">
+      <div class="panel" id="top-left">
+        <div class="hud-title">FlyBrain FPV · MaleCNS</div>
+        <div class="bar-row"><span class="bar-label">alt</span><div class="bar-track"><div class="bar-fill" id="bar-alt"></div></div><span class="bar-val" id="val-alt">0m</span></div>
+        <div class="bar-row"><span class="bar-label">speed</span><div class="bar-track"><div class="bar-fill" id="bar-spd"></div></div><span class="bar-val" id="val-spd">0m/s</span></div>
+        <div class="bar-row"><span class="bar-label">thr</span><div class="bar-track"><div class="bar-fill" id="bar-thr"></div></div><span class="bar-val" id="val-thr">0%</span></div>
+        <div class="bar-row"><span class="bar-label">clear</span><div class="bar-track"><div class="bar-fill" id="bar-clr"></div></div><span class="bar-val" id="val-clr">0m</span></div>
+        <div style="margin-top:6px">mode: <span id="mode-badge">CONNECTOME</span></div>
+        <div class="dim" style="opacity:0.55; margin-top:2px" id="circuit-info">circuit: loading…</div>
+      </div>
+      <div class="panel" id="top-right">
+        <div class="hud-title">Neural telemetry</div>
+        <div id="pop-stats">—</div>
+      </div>
+      <div class="panel" id="eye-views">
+        <div style="position:relative"><span class="eye-label">LEFT EYE · EMD flow</span><canvas id="eyeL" width="96" height="54"></canvas></div>
+        <div style="position:relative"><span class="eye-label">RIGHT EYE · EMD flow</span><canvas id="eyeR" width="96" height="54"></canvas></div>
+      </div>
+      <div class="panel" id="brain-traces">
+        <div class="hud-title">Descending-neuron drive → flight commands</div>
+        <canvas id="traces" width="600" height="220"></canvas>
+      </div>
+    </div>
+    <div id="startup">
+      <div class="card">
+        <h1>🪰 FLYBRAIN FPV</h1>
+        A quadcopter flown by a circuit of <b>real neurons</b> extracted from the MaleCNS
+        male fruit-fly connectome (Janelia/Google, Cell 2026 — CC-BY).<br/>
+        Compound-eye images → elementary motion detectors → optic-lobe &amp; descending-neuron
+        populations wired by actual synapse counts → flight commands.<br/>
+        <span class="dim">Low-altitude obstacle course · keys: WASD = nudge, C = toggle manual override, R = reset</span>
+        <div class="go">▶ CLICK TO LAUNCH</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

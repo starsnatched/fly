@@ -35,12 +35,14 @@ WebGL scene (FPV camera, 2 eyes at ±35°)
   - **SPIKING LIF**: every one of the 20,461 neurons has its own membrane
     voltage, threshold, refractory period, and spikes. Synapses are
     exponential-decay conductances delivered through 343,241 real connectome
-    edges (weights = per-target K-max-normalized synapse counts, signs from a
-    documented neurotransmitter heuristic). Sensory drive injects current per
-    population; T4/T5 additionally get direction-tuned EMD current (real
-    a/b/c/d directional subtypes from the data). A saturating feedback-
-    inhibition pool keeps recurrent excitation in the fluctuation-driven
-    regime (~1-8 Hz spontaneous, bursts on looming).
+    edges (weights = per-target K-max-normalized synapse counts; signs from
+    per-neuron neurotransmitter probabilities aggregated from **45.7M real
+    T-bars** — 18% of circuit neurons are GABAergic/inhibitory, peaking at
+    32% in the `inter` population; mean NT confidence 87%). Sensory drive
+    injects current per population; T4/T5 additionally get direction-tuned
+    EMD current (real a/b/c/d directional subtypes from the data). A
+    saturating feedback-inhibition pool keeps recurrent excitation in the
+    fluctuation-driven regime (~1-8 Hz spontaneous, bursts on looming).
   - Looming, saccades, wander, and command synthesis are shared
     (`src/shared.ts`), so flight character is preserved across brains.
 - **Readout** — descending-neuron pools: `avert` (LPLC-driven escape), `steer`
@@ -98,7 +100,9 @@ npm run dev
 - `src/main.ts` — glue: loop, cameras, HUD, spike raster
 - `scripts/extract_circuit.py` — connectome → population circuit JSON
 - `scripts/extract_lif_circuit.py` — connectome → per-neuron LIF circuit JSON
-  (adds hex retinotopy, T4/T5 directional subtypes, NT signs)
+  (adds hex retinotopy, T4/T5 directional subtypes, real NT signs)
+- `scripts/aggregate_nt.py` — stream 45.7M T-bar NT probabilities →
+  per-neuron mean profiles (`data/neuron-nt.json`)
 
 ## Credits & license
 

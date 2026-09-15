@@ -174,14 +174,26 @@ function loop(now: number): void {
   el("mode-badge").style.color = manual ? "#ffb347" : "#7cf7ff";
 
   const flightTime = (performance.now() - launchTime) / 1000;
-  const poolRows = useLif && lifBrain
-    ? `<div>spikes/frame <b style="color:#ffd166">${lifBrain.debug.spikesThisFrame ?? 0}</b></div>` +
+  let poolRows: string;
+  if (useLif && lifBrain) {
+    const net = lifBrain.network;
+    const gabaPct = Math.round((100 * net.inhibCount) / net.N);
+    const topGaba = net.populations
+      .map((p, i) => ({ p, f: net.gabaFraction[i] }))
+      .sort((a, b) => b.f - a.f)[0];
+    poolRows =
+      `<div>spikes/frame <b style="color:#ffd166">${lifBrain.debug.spikesThisFrame ?? 0}</b></div>` +
       `<div>LPLC <b style="color:#ff7d6b">${(lifBrain.debug.lplcHz ?? 0).toFixed(1)}Hz</b> · LC <b style="color:#ff7d6b">${(lifBrain.debug.lcHz ?? 0).toFixed(1)}Hz</b></div>` +
       `<div>T4 <b style="color:#7cf7ff">${(lifBrain.debug.t4Hz ?? 0).toFixed(1)}Hz</b> · T5 <b style="color:#7cf7ff">${(lifBrain.debug.t5Hz ?? 0).toFixed(1)}Hz</b></div>` +
-      `<div>avert <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b> · lift <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>`
-    : `<div>avert pool <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b></div>` +
+      `<div>avert <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b> · lift <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>` +
+      `<div style="opacity:0.75;margin-top:4px">GABAergic <b style="color:#c792ea">${gabaPct}%</b> (${net.inhibCount.toLocaleString()}) · peak ${topGaba.p} ${Math.round(100 * topGaba.f)}%</div>` +
+      `<div style="opacity:0.5">NT conf ${(net.meanNtConf * 100).toFixed(0)}% (45.7M T-bars)</div>`;
+  } else {
+    poolRows =
+      `<div>avert pool <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b></div>` +
       `<div>steer pool <b style="color:#7cf7ff">${cmd.pools.steer >= 0 ? "+" : ""}${cmd.pools.steer.toFixed(2)}</b></div>` +
       `<div>lift pool <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>`;
+  }
   el("pop-stats").innerHTML = poolRows +
     `<div style="opacity:0.6;margin-top:4px">airtime ${flightTime.toFixed(0)}s · bumps ${drone.bumpCount} · ` +
     `pos ${drone.pos.x.toFixed(0)}, ${drone.pos.z.toFixed(0)}m${lifBrain ? " · [B] brain" : ""}</div>`;

@@ -29,6 +29,7 @@ export interface LifPayload {
     maxHops: number;
     minSynapseWeight: number;
     ntHeuristic: string;
+    ntSource: string;
     hexFallback: number[];
     dirConvention: string;
   };
@@ -40,6 +41,8 @@ export interface LifPayload {
     hex: number[][];
     nt: number[];
     dir: number[];
+    /** confidence (max mean NT probability) per neuron */
+    ntConf: number[];
   };
   /** flat triplets [src, dst, weight] */
   edges: number[];

@@ -223,6 +223,15 @@ def main():
 
     # payload: SoA arrays for compactness
     ordered = sorted(idset)
+    # merge real per-neuron NT probabilities if available (aggregate_nt.py)
+    nt_file = DATA / "neuron-nt.json"
+    nt_lookup: dict[str, list[float]] = {}
+    if nt_file.exists():
+        nt_lookup = json.loads(nt_file.read_text())
+        print(f"  real NT profiles: {len(nt_lookup):,} bodies")
+
+    # write body-id list for the NT aggregation step (for future refreshes)
+    (DATA / "lif-bodies.txt").write_text("\n".join(str(idx_to_id[b]) for b in ordered))
     remap = {b: i for i, b in enumerate(ordered)}
     pop_names = sorted(set(pop_of.values()))
     pop_index = {p: i for i, p in enumerate(pop_names)}
@@ -233,6 +242,8 @@ def main():
     hex_out: list[list[int]] = []
     nt_out: list[int] = []
     dir_out: list[int] = []
+    nt_conf_out: list[float] = []
+    heuristic_signs = 0
     for b in ordered:
         nid = idx_to_id[b]
         t = type_of.get(nid, "")
@@ -241,8 +252,24 @@ def main():
         pop_out.append(pop_index[pop_of[b]])
         side_out.append(1 if (side_of.get(nid) or "")[:1] == "R" else 0)
         hex_out.append([h[0], h[1]])
-        nt_out.append(nt_sign(t))
         dir_out.append(dir_of(t))
+        prof = nt_lookup.get(str(nid))
+        if prof:
+            ach, gaba, glu = prof[0], prof[1], prof[2]
+            if gaba >= 0.5:
+                nt_out.append(-1)
+            elif ach >= 0.5 or glu >= 0.5:
+                nt_out.append(1)
+            else:
+                nt_out.append(nt_sign(t))  # weak profile: fall back to type rule
+                heuristic_signs += 1
+            nt_conf_out.append(round(max(prof), 3))
+        else:
+            nt_out.append(nt_sign(t))
+            nt_conf_out.append(0.0)
+            heuristic_signs += 1
+    if heuristic_signs:
+        print(f"  {heuristic_signs:,} neurons used type-rule fallback (weak/absent NT profile)")
 
     flat_edges: list[int] = []
     for a, b, wt in final:
@@ -256,7 +283,8 @@ def main():
             "license": "CC-BY 4.0",
             "maxHops": MAX_HOPS,
             "minSynapseWeight": MIN_EDGE_W,
-            "ntHeuristic": "C* types = GABAergic (inhibitory); all others cholinergic (excitatory)",
+            "ntHeuristic": "per-neuron mean NT probabilities from 45.7M T-bars (tbar-neurotransmitters table); GABA>=0.5 -> inhibitory, else excitatory; type-rule fallback for weak profiles",
+            "ntSource": "tbar-neurotransmitters-male-cns-v1.0.feather",
             "hexFallback": [-1, -1],
             "dirConvention": "T4/T5 subtype: a=up b=left c=down d=right, -1=n/a",
         },
@@ -268,6 +296,7 @@ def main():
             "hex": hex_out,
             "nt": nt_out,
             "dir": dir_out,
+            "ntConf": nt_conf_out,
         },
         "edges": flat_edges,
     }

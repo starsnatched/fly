@@ -62,6 +62,12 @@ export class LifNetwork {
 
   private popIndexOf: Map<string, number>;
   private meta: LifPayload["meta"];
+  /** inhibitory (GABAergic) fraction per population, from real NT data */
+  readonly gabaFraction: Float64Array;
+  readonly inhibCount: number;
+  readonly excitCount: number;
+  /** mean NT confidence (max mean probability) */
+  readonly meanNtConf: number;
 
   // neuron state
   private vm: Float32Array;
@@ -110,6 +116,28 @@ export class LifNetwork {
     this.popOf = new Uint8Array(payload.neurons.pop);
     this.ntSign = new Int8Array(payload.neurons.nt);
     this.dirOf = new Int8Array(payload.neurons.dir);
+
+    // NT statistics from real data
+    const gabaCount = new Float64Array(this.populations.length);
+    let inhib = 0, excit = 0, confSum = 0;
+    for (let i = 0; i < n; i++) {
+      if (this.ntSign[i] < 0) {
+        inhib++;
+        gabaCount[this.popOf[i]]++;
+      } else {
+        excit++;
+      }
+      confSum += payload.neurons.ntConf[i] ?? 0;
+    }
+    this.inhibCount = inhib;
+    this.excitCount = excit;
+    this.meanNtConf = confSum / n;
+    this.gabaFraction = new Float64Array(this.populations.length);
+    const counts = new Array(this.populations.length).fill(0);
+    for (let i = 0; i < n; i++) counts[this.popOf[i]]++;
+    for (let p = 0; p < this.populations.length; p++) {
+      this.gabaFraction[p] = counts[p] ? gabaCount[p] / counts[p] : 0;
+    }
     this.hexOf = new Int16Array(n * 2);
     payload.neurons.hex.forEach((h, i) => {
       this.hexOf[i * 2] = h[0];

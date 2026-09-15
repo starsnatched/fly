@@ -171,6 +171,13 @@ export class FlyVision {
     looming: { L: number; R: number; U: number; D: number };
     /** mean horizontal flow on left/right half of each eye (for expansion) */
     halfFlow: { L: { left: number; right: number }; R: { left: number; right: number } };
+    /** aggregates for the LIF engine */
+    agg: {
+      flowHLeft: number;
+      flowHMean: number;
+      flowVMean: number;
+      darkFraction: number;
+    };
   } {
     const out = {
       flowH: { L: 0, R: 0, U: 0, D: 0 },
@@ -180,6 +187,7 @@ export class FlyVision {
         L: { left: 0, right: 0 },
         R: { left: 0, right: 0 },
       },
+      agg: { flowHLeft: 0, flowHMean: 0, flowVMean: 0, darkFraction: 0 },
     };
     const squash = (x: number) => Math.max(-1, Math.min(1, x * 6));
     for (const side of ["L", "R"] as const) {
@@ -231,6 +239,28 @@ export class FlyVision {
     out.flowH.D = (third(this.eyeL, 18, 27, "h") + third(this.eyeR, 18, 27, "h")) / 2;
     out.flowV.U = (third(this.eyeL, 0, 9, "v") + third(this.eyeR, 0, 9, "v")) / 2;
     out.flowV.D = (third(this.eyeL, 18, 27, "v") + third(this.eyeR, 18, 27, "v")) / 2;
+
+    // aggregates over the left half of the combined field + means
+    let hl = 0, vm = 0, hm = 0, dk = 0, nA = 0;
+    for (const flow of [this.eyeL, this.eyeR]) {
+      for (let gy = 1; gy < GRID_H - 1; gy++) {
+        for (let gx = 1; gx < GRID_W - 1; gx++) {
+          const i = gy * GRID_W + gx;
+          const h = squash(flow.h[i]);
+          hm += h;
+          vm += squash(flow.v[i]);
+          dk += flow.lum[i] < 0.35 ? 1 : 0;
+          if (gx < GRID_W / 2) hl += h;
+          nA++;
+        }
+      }
+    }
+    if (nA) {
+      out.agg.flowHLeft = (hl / (nA / 2)) * 1;
+      out.agg.flowHMean = hm / nA;
+      out.agg.flowVMean = vm / nA;
+      out.agg.darkFraction = dk / nA;
+    }
     return out;
   }
 

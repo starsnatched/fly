@@ -29,10 +29,20 @@ WebGL scene (FPV camera, 2 eyes at ±35°)
 - **Looming detection** — the fly's escape trigger: angular size of the nearest
   dark silhouette *and* its growth above an adapted baseline. Saccades suppress
   detection mid-turn and reset adaptation afterwards (post-saccadic reset).
-- **Brain** — a leaky-integrator network over 12 neuron populations. The
-  connection weights are the connectome's own aggregated synapse counts
-  (`popMatrix` in `public/fly-circuit.json`), normalized and tempered, with a
-  lumped global inhibitory pool (the fly's GABAergic wide-field neurons).
+- **Brain** — two interchangeable controllers (press **B** to hot-swap):
+  - **RATE** (default): leaky-integrator population network, 12 populations,
+    wiring = the connectome's own aggregated synapse counts.
+  - **SPIKING LIF**: every one of the 20,461 neurons has its own membrane
+    voltage, threshold, refractory period, and spikes. Synapses are
+    exponential-decay conductances delivered through 343,241 real connectome
+    edges (weights = per-target K-max-normalized synapse counts, signs from a
+    documented neurotransmitter heuristic). Sensory drive injects current per
+    population; T4/T5 additionally get direction-tuned EMD current (real
+    a/b/c/d directional subtypes from the data). A saturating feedback-
+    inhibition pool keeps recurrent excitation in the fluctuation-driven
+    regime (~1-8 Hz spontaneous, bursts on looming).
+  - Looming, saccades, wander, and command synthesis are shared
+    (`src/shared.ts`), so flight character is preserved across brains.
 - **Readout** — descending-neuron pools: `avert` (LPLC-driven escape), `steer`
   (lateral flow asymmetry), `lift` (PD altitude hold near 2 m). Looming
   triggers a rapid **body saccade** away from the threat — the fly's own
@@ -73,16 +83,22 @@ npm run dev
 | click | launch |
 | `W A S D` | nudge thrust |
 | `C` | toggle manual override |
+| `B` | hot-swap rate ↔ spiking LIF brain |
 | `R` | respawn |
 
 ## Files
 
 - `src/vision.ts` — compound eyes + EMDs + looming readout
-- `src/brain.ts` — connectome-wired leaky-integrator network, saccade state machine
+- `src/brain.ts` — rate-based population network (connectome-wired)
+- `src/lif.ts` — spiking LIF engine (per-neuron Vm, spikes, exponential synapses)
+- `src/lifbrain.ts` — LIF controller adapter (same interface as FlyBrain)
+- `src/shared.ts` — shared looming / saccade / wander / command circuit
 - `src/drone.ts` — quadrotor physics
-- `src/world.ts` — obstacle course generation + collision queries
-- `src/main.ts` — glue: loop, cameras, HUD
-- `scripts/extract_circuit.py` — connectome → circuit JSON
+- `src/world.ts` — obstacle world generation + collision queries
+- `src/main.ts` — glue: loop, cameras, HUD, spike raster
+- `scripts/extract_circuit.py` — connectome → population circuit JSON
+- `scripts/extract_lif_circuit.py` — connectome → per-neuron LIF circuit JSON
+  (adds hex retinotopy, T4/T5 directional subtypes, NT signs)
 
 ## Credits & license
 

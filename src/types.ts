@@ -22,6 +22,29 @@ export interface CircuitPayload {
   popMatrix: [string, string, number][];
 }
 
+export interface LifPayload {
+  meta: {
+    dataset: string;
+    license: string;
+    maxHops: number;
+    minSynapseWeight: number;
+    ntHeuristic: string;
+    hexFallback: number[];
+    dirConvention: string;
+  };
+  populations: string[];
+  neurons: {
+    id: number[];
+    pop: number[];
+    side: number[];
+    hex: number[][];
+    nt: number[];
+    dir: number[];
+  };
+  /** flat triplets [src, dst, weight] */
+  edges: number[];
+}
+
 /** Per-eye motion energy: horizontal (rightward) and vertical (upward) flow. */
 export interface EyeFlow {
   h: Float32Array; // GRID_W * GRID_H, positive = rightward motion

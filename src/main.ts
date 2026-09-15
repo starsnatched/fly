@@ -1,6 +1,7 @@
 import * as THREE from "three";
-import type { CircuitPayload } from "./types";
+import type { CircuitPayload, LifPayload } from "./types";
 import { FlyBrain } from "./brain";
+import { LifBrain } from "./lifbrain";
 import { FlyVision } from "./vision";
 import { Drone, WORLD } from "./drone";
 import { buildScene, checkCollision, resolveCollision, clearanceAhead } from "./world";
@@ -9,7 +10,10 @@ let renderer: THREE.WebGLRenderer;
 let scene: THREE.Scene;
 let camera: THREE.PerspectiveCamera;
 let vision: FlyVision;
-let brain: FlyBrain;
+let rateBrain: FlyBrain;
+let lifBrain: LifBrain | null = null;
+let useLif = false;
+let brain: FlyBrain | LifBrain;
 let drone: Drone;
 let manual = false;
 const keys = new Set<string>();
@@ -36,20 +40,36 @@ async function init(): Promise<void> {
   drone.yaw = 0; // body -Z = world -Z: face down the course
   void WORLD;
 
-  // load the connectome-derived circuit
+  // load the connectome-derived circuits (rate + spiking)
   const res = await fetch("/fly-circuit.json");
   const payload = (await res.json()) as CircuitPayload;
-  brain = new FlyBrain(payload);
+  rateBrain = new FlyBrain(payload);
+  brain = rateBrain;
   vision = new FlyVision(renderer);
 
-  el("circuit-info").textContent =
-    `${brain.neuronCount.toLocaleString()} neurons / ${brain.edgeCount.toLocaleString()} connections / ` +
-    `${Math.round(brain.synapses / 1e6)}M synapses - MaleCNS v1.0 [r3]`;
+  // LIF circuit loads in the background (adds ~5 MB)
+  fetch("/fly-lif.json")
+    .then((r) => r.json() as Promise<LifPayload>)
+    .then((lp) => {
+      lifBrain = new LifBrain(lp);
+      el("lif-status").textContent = `LIF ready (B to switch)`;
+      updateCircuitInfo();
+    })
+    .catch(() => {
+      el("lif-status").textContent = "LIF unavailable";
+    });
+
+  updateCircuitInfo();
 
   window.addEventListener("keydown", (e) => {
     keys.add(e.key.toLowerCase());
     if (e.key.toLowerCase() === "c") manual = !manual;
     if (e.key.toLowerCase() === "r") drone.respawn();
+    if (e.key.toLowerCase() === "b" && lifBrain) {
+      useLif = !useLif;
+      brain = useLif ? lifBrain : rateBrain;
+      updateCircuitInfo();
+    }
   });
   window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
   window.addEventListener("resize", () => {
@@ -92,6 +112,7 @@ function loop(now: number): void {
     dt,
   });
   (window as unknown as { __flybrainDebug: Record<string, number> }).__flybrainDebug = brain.debug;
+  (window as unknown as { __lifBrain: LifBrain | null }).__lifBrain = lifBrain;
 
   if (manual) {
     cmd.throttle = 0.55 + drone.nudge.fwd * 0;
@@ -153,16 +174,22 @@ function loop(now: number): void {
   el("mode-badge").style.color = manual ? "#ffb347" : "#7cf7ff";
 
   const flightTime = (performance.now() - launchTime) / 1000;
-  el("pop-stats").innerHTML =
-    `<div>avert pool <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b></div>` +
-    `<div>steer pool <b style="color:#7cf7ff">${cmd.pools.steer >= 0 ? "+" : ""}${cmd.pools.steer.toFixed(2)}</b></div>` +
-    `<div>lift pool <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>` +
+  const poolRows = useLif && lifBrain
+    ? `<div>spikes/frame <b style="color:#ffd166">${lifBrain.debug.spikesThisFrame ?? 0}</b></div>` +
+      `<div>LPLC <b style="color:#ff7d6b">${(lifBrain.debug.lplcHz ?? 0).toFixed(1)}Hz</b> · LC <b style="color:#ff7d6b">${(lifBrain.debug.lcHz ?? 0).toFixed(1)}Hz</b></div>` +
+      `<div>T4 <b style="color:#7cf7ff">${(lifBrain.debug.t4Hz ?? 0).toFixed(1)}Hz</b> · T5 <b style="color:#7cf7ff">${(lifBrain.debug.t5Hz ?? 0).toFixed(1)}Hz</b></div>` +
+      `<div>avert <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b> · lift <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>`
+    : `<div>avert pool <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b></div>` +
+      `<div>steer pool <b style="color:#7cf7ff">${cmd.pools.steer >= 0 ? "+" : ""}${cmd.pools.steer.toFixed(2)}</b></div>` +
+      `<div>lift pool <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>`;
+  el("pop-stats").innerHTML = poolRows +
     `<div style="opacity:0.6;margin-top:4px">airtime ${flightTime.toFixed(0)}s · bumps ${drone.bumpCount} · ` +
-    `pos ${drone.pos.x.toFixed(0)}, ${drone.pos.z.toFixed(0)}m</div>`;
+    `pos ${drone.pos.x.toFixed(0)}, ${drone.pos.z.toFixed(0)}m${lifBrain ? " · [B] brain" : ""}</div>`;
 
   traceHist.push({ avert: cmd.pools.avert, steer: cmd.pools.steer, lift: cmd.pools.lift, thr: cmd.throttle });
   if (traceHist.length > 150) traceHist.shift();
   drawTraces();
+  drawRaster();
 
   vision.drawEyeCanvas(el("eyeL") as HTMLCanvasElement, "L");
   vision.drawEyeCanvas(el("eyeR") as HTMLCanvasElement, "R");
@@ -170,8 +197,96 @@ function loop(now: number): void {
   render();
 }
 
+function updateCircuitInfo(): void {
+  const mode = useLif ? "SPIKING LIF" : "RATE";
+  const syn = brain.synapses >= 1e6
+    ? `${Math.round(brain.synapses / 1e6)}M`
+    : `${Math.round(brain.synapses / 1e3)}k`;
+  el("circuit-info").textContent =
+    `${mode}: ${brain.neuronCount.toLocaleString()} neurons / ${brain.edgeCount.toLocaleString()} connections / ` +
+    `${syn} synapses - MaleCNS v1.0 [r4]`;
+  el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : (useLif ? "EXPLORE · LIF" : "EXPLORE · CONNECTOME");
+}
+
 function render(): void {
   renderer.render(scene, camera);
+}
+
+// ---- spike raster ----
+interface RasterRow { popIdx: number; neurons: number[]; spikes: boolean[][]; }
+const RASTER_POPS = ["T4", "T5", "LC", "LPLC", "TmY", "descending"];
+const RASTER_N = 8;
+const RASTER_COLS = 240;
+let rasterRows: RasterRow[] | null = null;
+let rasterCol = 0;
+
+function ensureRaster(): void {
+  if (rasterRows || !useLif || !lifBrain) return;
+  const net = lifBrain.network;
+  rasterRows = RASTER_POPS.map((p) => {
+    const popIdx = net.populations.indexOf(p);
+    const neurons = popIdx >= 0
+      ? net.indicesOfPop(p, RASTER_N)
+      : [];
+    while (neurons.length < RASTER_N) neurons.push(-1);
+    return { popIdx, neurons, spikes: Array.from({ length: RASTER_N }, () => new Array(RASTER_COLS).fill(false)) };
+  });
+}
+
+function drawRaster(): void {
+  ensureRaster();
+  const c = el("raster") as HTMLCanvasElement;
+  const ctx = c.getContext("2d");
+  if (!ctx) return;
+  ctx.fillStyle = "rgba(4, 8, 10, 0.85)";
+  ctx.fillRect(0, 0, c.width, c.height);
+  if (!rasterRows || !useLif || !lifBrain) {
+    ctx.fillStyle = "rgba(150,190,170,0.4)";
+    ctx.font = "11px monospace";
+    ctx.fillText("switch to LIF brain with [B] to see spikes", 12, c.height / 2);
+    return;
+  }
+  const net = lifBrain.network;
+  // record this frame's spikes
+  for (const row of rasterRows) {
+    for (let k = 0; k < row.neurons.length; k++) {
+      const idx = row.neurons[k];
+      row.spikes[k][rasterCol] = idx >= 0 && net.spiked(idx);
+    }
+  }
+  rasterCol = (rasterCol + 1) % RASTER_COLS;
+
+  const rowH = c.height / rasterRows.length;
+  RASTER_POPS.forEach((p, r) => {
+    const y0 = r * rowH;
+    ctx.fillStyle = "rgba(150,190,170,0.55)";
+    ctx.font = "9px monospace";
+    ctx.fillText(p, 4, y0 + rowH / 2 + 3);
+    const row = rasterRows![r];
+    for (let k = 0; k < RASTER_N; k++) {
+      const yy = y0 + (k / RASTER_N) * rowH;
+      for (let ci = 0; ci < RASTER_COLS; ci++) {
+        if (row.spikes[k][ci]) {
+          const x = (ci / RASTER_COLS) * c.width;
+          const fade = ci === (rasterCol - 1 + RASTER_COLS) % RASTER_COLS ? 1 : 0.75;
+          ctx.fillStyle = `rgba(60, 255, 170, ${fade})`;
+          ctx.fillRect(x + 22, yy, 1.4, Math.max(1.2, rowH / RASTER_N - 0.4));
+        }
+      }
+    }
+    ctx.strokeStyle = "rgba(60, 255, 160, 0.08)";
+    ctx.beginPath();
+    ctx.moveTo(0, y0);
+    ctx.lineTo(c.width, y0);
+    ctx.stroke();
+  });
+  // sweep line
+  const sx = (rasterCol / RASTER_COLS) * c.width;
+  ctx.strokeStyle = "rgba(255, 209, 102, 0.5)";
+  ctx.beginPath();
+  ctx.moveTo(sx + 22, 0);
+  ctx.lineTo(sx + 22, c.height);
+  ctx.stroke();
 }
 
 function drawTraces(): void {

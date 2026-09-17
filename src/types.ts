@@ -1,8 +1,5 @@
-import type { EyeStats } from "./shared";
-
-/** Sensory + body state handed to the controller each frame. */
+/** Sensory + body state handed to a controller each frame. */
 export interface BrainInputs {
-  stats: EyeStats;
   /** height above ground (m) */
   altitude: number;
   /** vertical velocity m/s (positive = climbing) */
@@ -11,9 +8,15 @@ export interface BrainInputs {
   heading: number;
   speed: number;
   dt: number;
+  /** clearance ahead along heading (m); drives the reward signal if present */
+  clearance?: number;
+  /** raw per-eye RGB grids (RENDER_W*RENDER_H*3, stride 3 = R,G,B) — the only
+   *  visual signal the brain receives: the server's hex-consistent sampler
+   *  accepts any client resolution */
+  rgb?: { L: Float32Array; R: Float32Array };
 }
 
-/** Flight commands emitted by the controller. */
+/** Flight commands emitted by a controller. */
 export interface BrainOutputs {
   /** 0..1 vertical thrust */
   throttle: number;
@@ -27,35 +30,9 @@ export interface BrainOutputs {
   pools: { avert: number; steer: number; lift: number };
 }
 
-export interface LifPayload {
-  meta: {
-    dataset: string;
-    license: string;
-    maxHops: number;
-    minSynapseWeight: number;
-    ntHeuristic: string;
-    ntSource: string;
-    hexFallback: number[];
-    dirConvention: string;
-  };
-  populations: string[];
-  neurons: {
-    id: number[];
-    pop: number[];
-    side: number[];
-    hex: number[][];
-    nt: number[];
-    dir: number[];
-    /** confidence (max mean NT probability) per neuron */
-    ntConf: number[];
-  };
-  /** flat triplets [src, dst, weight] */
-  edges: number[];
-}
-
-/** Per-eye motion energy: horizontal (rightward) and vertical (upward) flow. */
+/** One compound eye's processed flow fields (client-side visualization). */
 export interface EyeFlow {
   h: Float32Array; // GRID_W * GRID_H, positive = rightward motion
   v: Float32Array; // GRID_W * GRID_H, positive = upward motion
-  lum: Float32Array; // current luminance grid
+  lum: Float32Array; // GRID_W * GRID_H, 0..1 luminance
 }

@@ -1,0 +1,60 @@
+{
+  "engine": {
+    "binary": "public/fly-brain-full.bin",
+    "gScale": 0.3,
+    "tgtBudget": 36.0,
+    "phTonic": 5.0,
+    "phOpticGain": 2.0,
+    "emdGain": 10.0,
+    "danModGain": 0.6,
+    "danTonicMv": 1.5,
+    "learning": true,
+    "tickCostSeedMs": 30.0
+  },
+  "simSpeed": 1.0,
+  "maxBioMsPerTick": 20.0,
+  "rewardPeriodS": 0.25,
+  "autosaveS": 5.0,
+  "memoryPath": "state/brain-memory.json",
+  "sensors": {
+    "eyes": { "count": 1, "leftId": 0, "rightId": 1 },
+    "scalarRanges": {
+      "altitude": [0.0, 30.0],
+      "speed": [0.0, 18.0],
+      "vy": [-8.0, 8.0],
+      "clearance": [0.0, 60.0]
+    }
+  },
+  "readout": {
+    "dnHzScale": 8.0,
+    "hover": { "throttle": 0.29, "pitch": -0.2 },
+    "altGain": 0.35,
+    "altDamp": 1.2,
+    "targetAlt": 5.0,
+    "cruisePitch": -0.2,
+    "turnGain": 6.0,
+    "saccadeRate": 0.22,
+    "saccadeYaw": 0.85,
+    "saccadeRoll": 0.6,
+    "wanderTau": 4.0,
+    "wanderAmp": 0.25
+  },
+  "actuators": {
+    "channels": [
+      { "name": "throttle", "lo": 0.0, "hi": 1.0, "slewPerS": 6.0, "default": 0.29 },
+      { "name": "pitch", "lo": -1.0, "hi": 1.0, "slewPerS": 8.0, "default": -0.35 },
+      { "name": "roll", "lo": -1.0, "hi": 1.0, "slewPerS": 8.0, "default": 0.0 },
+      { "name": "yaw", "lo": -1.0, "hi": 1.0, "slewPerS": 8.0, "default": 0.0 }
+    ]
+  },
+  "reward": {
+    "openSkyStart": 0.1,
+    "openSkyEnd": 0.5,
+    "openSkyReward": 0.35,
+    "bumpPenalty": -0.5
+  },
+  "network": {
+    "wsPort": 8787,
+    "restPort": 8788
+  }
+}

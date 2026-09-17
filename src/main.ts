@@ -1,15 +1,25 @@
 import * as THREE from "three";
-import type { LifPayload } from "./types";
-import { LifBrain } from "./lifbrain";
+import { RemoteBrain } from "./remotebrain";
 import { FlyVision } from "./vision";
 import { Drone, WORLD } from "./drone";
 import { buildScene, checkCollision, resolveCollision, clearanceAhead } from "./world";
+
+/**
+ * FlyBrain FPV client: a pure embodiment.
+ *
+ * The browser renders the world, captures both compound eyes at full
+ * resolution, streams them (plus proprioception) to the C connectome
+ * server, and applies the actuator channels it receives back. All
+ * cognition lives behind the API — see cengine/README.md.
+ */
+
+const BRAIN_SERVER = "ws://localhost:8787/stream";
 
 let renderer: THREE.WebGLRenderer;
 let scene: THREE.Scene;
 let camera: THREE.PerspectiveCamera;
 let vision: FlyVision;
-let brain: LifBrain;
+let brain: RemoteBrain;
 let drone: Drone;
 let manual = false;
 const keys = new Set<string>();
@@ -19,6 +29,21 @@ const el = (id: string) => document.getElementById(id)!;
 const bar = (id: string, v: number) => {
   (el(id) as HTMLElement).style.width = `${Math.round(Math.max(0, Math.min(1, v)) * 100)}%`;
 };
+
+/** State the remote brain needs each frame (eye RGB + proprioception). */
+function remoteStats(): {
+  altitude: number; vy: number; clearance: number; collision: boolean;
+  rgbL: Float32Array; rgbR: Float32Array;
+} {
+  const rgb = vision.rgb;
+  return {
+    altitude: drone.pos.y - WORLD.groundY,
+    vy: drone.vel.y,
+    clearance: clearanceAhead(drone.pos, drone.yaw),
+    collision: false,
+    rgbL: rgb.L, rgbR: rgb.R, // single forward eye; only rgbL is streamed
+  };
+}
 
 async function init(): Promise<void> {
   renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -36,18 +61,27 @@ async function init(): Promise<void> {
   drone.yaw = 0; // body -Z = world -Z: face down the course
   void WORLD;
 
-  // load the connectome-derived spiking circuit
-  const res = await fetch("/fly-lif.json");
-  const payload = (await res.json()) as LifPayload;
-  brain = new LifBrain(payload);
   vision = new FlyVision(renderer);
 
-  updateCircuitInfo();
+  // The browser is an embodiment, nothing more: it always streams to the
+  // brain server and waits until the backend answers.
+  brain = new RemoteBrain(BRAIN_SERVER, remoteStats, () => {
+    el("mode-badge").textContent = "REMOTE BRAIN";
+    updateCircuitInfo();
+  });
 
   window.addEventListener("keydown", (e) => {
     keys.add(e.key.toLowerCase());
     if (e.key.toLowerCase() === "c") manual = !manual;
     if (e.key.toLowerCase() === "r") drone.respawn();
+    if (e.key.toLowerCase() === "l") {
+      brain.setLearning(!brain.learning);
+      flashBadge(brain.learning ? "LEARNING ON" : "LEARNING OFF");
+    }
+    if (e.key.toLowerCase() === "m") {
+      brain.wipeMemory();
+      flashBadge("MEMORY WIPED");
+    }
   });
   window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
   window.addEventListener("resize", () => {
@@ -60,41 +94,69 @@ async function init(): Promise<void> {
   requestAnimationFrame(loop);
 }
 
+function flashBadge(msg: string): void {
+  el("mode-badge").textContent = msg;
+  setTimeout(() => {
+    el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : "REMOTE BRAIN";
+  }, 2500);
+}
+
+function updateCircuitInfo(): void {
+  const t = brain.telemetry();
+  el("circuit-info").textContent = t
+    ? `REMOTE FULL BRAIN: ${t.neurons.toLocaleString()} neurons / ` +
+      `${((t.edges ?? 0) / 1e6).toFixed(1)}M synapses @ C engine backend`
+    : "REMOTE BRAIN: C connectome server";
+  el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : "REMOTE BRAIN";
+}
+
 let last = performance.now();
 let launchTime = performance.now();
-const traceHist: { avert: number; steer: number; lift: number; thr: number }[] = [];
+const traceHist: { avert: number; steer: number; lift: number; thr: number; dopa: number; steerLearn: number }[] = [];
 
 function loop(): void {
   requestAnimationFrame(loop);
   const now = performance.now();
   const dt = Math.min((now - last) / 1000, 0.06);
   last = now;
-  if (!drone.alive) {
-    render();
-    return;
-  }
 
   // manual nudges
   drone.nudge.fwd = (keys.has("w") ? 1 : 0) - (keys.has("s") ? 1 : 0);
   drone.nudge.right = (keys.has("d") ? 1 : 0) - (keys.has("a") ? 1 : 0);
 
-  // vision -> brain
+  // vision -> brain: full-resolution per-eye RGB + proprioception
   vision.update(scene, drone.pos, drone.yaw, drone.pitch, drone.roll, dt);
-  const stats = vision.quadrantStats();
-  const speed = drone.vel.length();
-  const cmd = brain.step({
-    stats,
-    altitude: drone.pos.y - WORLD.groundY,
-    vy: drone.vel.y,
-    heading: drone.yaw,
-    speed,
-    dt,
-  });
-  (window as unknown as { __flybrainDebug: Record<string, number> }).__flybrainDebug = brain.debug;
-  (window as unknown as { __lifBrain: LifBrain }).__lifBrain = brain;
+  const speed = Number.isFinite(drone.vel.length()) ? drone.vel.length() : 0;
+  const clr = clearanceAhead(drone.pos, drone.yaw);
+
+  // wait for the backend before flying: no server, no commands
+  if (!brain.hasActions) {
+    el("circuit-info").textContent =
+      `waiting for brain server at ${BRAIN_SERVER} — run: ` +
+      `docker compose up  (cengine)`;
+    el("pop-stats").innerHTML =
+      `<div style="color:#ffd166">○ brain offline — retrying…</div>`;
+    renderEyePanels();
+    render();
+    return;
+  }
+
+  const cmd = brain.step(dt);
+  // command sanitizer: the physics must never see a non-finite command
+  cmd.throttle = Number.isFinite(cmd.throttle) ? Math.max(0, Math.min(1, cmd.throttle)) : 0.29;
+  cmd.pitch = Number.isFinite(cmd.pitch) ? Math.max(-1, Math.min(1, cmd.pitch)) : 0;
+  cmd.roll = Number.isFinite(cmd.roll) ? Math.max(-1, Math.min(1, cmd.roll)) : 0;
+  cmd.yaw = Number.isFinite(cmd.yaw) ? Math.max(-1, Math.min(1, cmd.yaw)) : 0;
+
+  (window as unknown as { __flybrainDebug: Record<string, number> }).__flybrainDebug =
+    remoteDebug(brain.telemetry());
+  (window as unknown as { __flyBrain: RemoteBrain }).__flyBrain = brain;
+  (window as unknown as { __flyVision: FlyVision }).__flyVision = vision;
+  (window as unknown as { __flyScene: THREE.Scene }).__flyScene = scene;
+  (window as unknown as { __flyDrone: Drone }).__flyDrone = drone;
 
   if (manual) {
-    cmd.throttle = 0.55 + drone.nudge.fwd * 0;
+    cmd.throttle = 0.29;
     cmd.pitch = -0.2 + (keys.has("i") ? -0.6 : 0) + (keys.has("k") ? 0.6 : 0);
     cmd.roll = drone.nudge.right;
     cmd.yaw = (keys.has("j") ? -0.8 : 0) + (keys.has("l") ? 0.8 : 0);
@@ -103,6 +165,13 @@ function loop(): void {
   }
 
   drone.step(cmd, dt);
+
+  // NaN tripwire: if drone state ever goes non-finite (should be impossible
+  // with sanitized commands), respawn instead of rendering nothing forever
+  if (!Number.isFinite(drone.pos.x + drone.pos.y + drone.pos.z + drone.vel.x + drone.vel.y + drone.vel.z)) {
+    console.warn("[drone] non-finite state — respawn");
+    drone.respawn();
+  }
 
   // collisions: soft bump + bounce (explore mode - no restarts).
   // Bumps notify the brain so it picks a new heading.
@@ -138,7 +207,7 @@ function loop(): void {
   );
   camera.lookAt(look);
 
-  // telemetry
+  // telemetry bars
   const alt = drone.pos.y - WORLD.groundY;
   bar("bar-alt", alt / WORLD.ceilingY);
   el("val-alt").textContent = `${alt.toFixed(1)}m`;
@@ -146,124 +215,63 @@ function loop(): void {
   el("val-spd").textContent = `${speed.toFixed(1)}m/s`;
   bar("bar-thr", cmd.throttle);
   el("val-thr").textContent = `${Math.round(cmd.throttle * 100)}%`;
-  const clr = clearanceAhead(drone.pos, drone.yaw);
   bar("bar-clr", 1 - clr / 60);
   el("val-clr").textContent = `${clr.toFixed(0)}m`;
-  el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : "EXPLORE · LIF";
+  if (!manual) el("mode-badge").textContent = "REMOTE BRAIN";
   el("mode-badge").style.color = manual ? "#ffb347" : "#7cf7ff";
 
-  const flightTime = (performance.now() - launchTime) / 1000;
-  const net = brain.network;
-  const gabaPct = Math.round((100 * net.inhibCount) / net.N);
-  const topGaba = net.populations
-    .map((p, i) => ({ p, f: net.gabaFraction[i] }))
-    .sort((a, b) => b.f - a.f)[0];
-  const poolRows =
-    `<div>spikes/frame <b style="color:#ffd166">${brain.debug.spikesThisFrame ?? 0}</b></div>` +
-    `<div>LPLC <b style="color:#ff7d6b">${(brain.debug.lplcHz ?? 0).toFixed(1)}Hz</b> · LC <b style="color:#ff7d6b">${(brain.debug.lcHz ?? 0).toFixed(1)}Hz</b></div>` +
-    `<div>T4 <b style="color:#7cf7ff">${(brain.debug.t4Hz ?? 0).toFixed(1)}Hz</b> · T5 <b style="color:#7cf7ff">${(brain.debug.t5Hz ?? 0).toFixed(1)}Hz</b></div>` +
-    `<div>avert <b style="color:#ff7d6b">${cmd.pools.avert.toFixed(2)}</b> · lift <b style="color:#9dff87">${cmd.pools.lift.toFixed(2)}</b></div>` +
-    `<div style="opacity:0.75;margin-top:4px">GABAergic <b style="color:#c792ea">${gabaPct}%</b> (${net.inhibCount.toLocaleString()}) · peak ${topGaba.p} ${Math.round(100 * topGaba.f)}%</div>` +
-    `<div style="opacity:0.5">NT conf ${(net.meanNtConf * 100).toFixed(0)}% (45.7M T-bars)</div>`;
-  el("pop-stats").innerHTML = poolRows +
-    `<div style="opacity:0.6;margin-top:4px">airtime ${flightTime.toFixed(0)}s · bumps ${drone.bumpCount} · ` +
-    `pos ${drone.pos.x.toFixed(0)}, ${drone.pos.z.toFixed(0)}m</div>`;
-
-  traceHist.push({ avert: cmd.pools.avert, steer: cmd.pools.steer, lift: cmd.pools.lift, thr: cmd.throttle });
-  if (traceHist.length > 150) traceHist.shift();
+  updateTelemetry(cmd);
+  renderEyePanels();
   drawTraces();
-  drawRaster();
-
-  vision.drawEyeCanvas(el("eyeL") as HTMLCanvasElement, "L");
-  vision.drawEyeCanvas(el("eyeR") as HTMLCanvasElement, "R");
-
   render();
 }
 
-function updateCircuitInfo(): void {
-  const syn = brain.synapses >= 1e6
-    ? `${Math.round(brain.synapses / 1e6)}M`
-    : `${Math.round(brain.synapses / 1e3)}k`;
+/** Synthesize the debug record from remote telemetry. */
+function remoteDebug(t: ReturnType<RemoteBrain["telemetry"]>): Record<string, number> {
+  if (!t) return {};
+  const r = t.rates;
+  return {
+    t4Hz: r["T4"] ?? 0, t5Hz: r["T5"] ?? 0,
+    lcHz: r["LC"] ?? 0, lplcHz: r["LPLC"] ?? 0,
+    kcHz: r["KC"] ?? 0, danHz: r["DAN"] ?? 0, dnHz: r["descending"] ?? 0,
+    dopa: t.dopa, dnSteer: t.dnSteer, simSpeed: 1,
+  };
+}
+
+function updateTelemetry(cmd: ReturnType<RemoteBrain["step"]>): void {
+  const t = brain.telemetry();
+  const d = t?.rates ?? {};
+  const flightTime = (performance.now() - launchTime) / 1000;
+  const poolRows =
+    `<div style="color:#9dff87">● REMOTE BRAIN · ${brain.status()}</div>` +
+    `<div>LPLC <b style="color:#ff7d6b">${(d["LPLC"] ?? 0).toFixed(1)}Hz</b> · LC <b style="color:#ff7d6b">${(d["LC"] ?? 0).toFixed(1)}Hz</b></div>` +
+    `<div>T4 <b style="color:#7cf7ff">${(d["T4"] ?? 0).toFixed(1)}Hz</b> · T5 <b style="color:#7cf7ff">${(d["T5"] ?? 0).toFixed(1)}Hz</b></div>` +
+    `<div style="opacity:0.8">KC <b style="color:#c792ea">${(d["KC"] ?? 0).toFixed(2)}Hz</b> · DAN <b style="color:#ff4fd8">${(d["DAN"] ?? 0).toFixed(1)}Hz</b> · DN <b style="color:#ffd166">${(d["descending"] ?? 0).toFixed(1)}Hz</b></div>` +
+    `<div style="margin-top:4px">memory <b style="color:${t?.learning ? "#1de9a0" : "#888"}">${t?.learning ? "● LEARNING" : "○ idle"}</b> · ` +
+    `<b style="color:#ffd166">${(t?.memEdited ?? 0).toLocaleString()}</b> syn edited</div>` +
+    `<div style="opacity:0.75">dopa <b style="color:#ff7d6b">${(t?.dopa ?? 0).toFixed(2)}</b> · ` +
+    `turn <b style="color:#7cf7ff">${(t?.dnSteer ?? 0).toFixed(2)}</b> · ` +
+    `bumps ${drone.bumpCount}</div>`;
+  el("pop-stats").innerHTML = poolRows +
+    `<div style="opacity:0.6;margin-top:4px">airtime ${flightTime.toFixed(0)}s · bumps ${drone.bumpCount} · ` +
+    `pos ${drone.pos.x.toFixed(0)}, ${drone.pos.z.toFixed(0)}m</div>`;
   el("circuit-info").textContent =
-    `SPIKING LIF: ${brain.neuronCount.toLocaleString()} neurons / ` +
-    `${brain.edgeCount.toLocaleString()} connections / ${syn} synapses - MaleCNS v1.0`;
-  el("mode-badge").textContent = manual ? "MANUAL OVERRIDE" : "EXPLORE · LIF";
+    `REMOTE FULL BRAIN: ${(t?.neurons ?? 0).toLocaleString()} neurons / ` +
+    `${((t?.edges ?? 0) / 1e6).toFixed(1)}M synapses @ C engine backend`;
+  traceHist.push({
+    avert: Math.abs(cmd.roll), steer: cmd.pools.steer, lift: cmd.pools.lift,
+    thr: cmd.throttle, dopa: t?.dopa ?? 0, steerLearn: t?.dnSteer ?? 0,
+  });
+  if (traceHist.length > 150) traceHist.shift();
+}
+
+function renderEyePanels(): void {
+  vision.drawEyeCanvas(el("eyeL") as HTMLCanvasElement, "L");
+  vision.drawRgbCanvas(el("eyeLrgb") as HTMLCanvasElement, "L");
 }
 
 function render(): void {
   renderer.render(scene, camera);
-}
-
-// ---- spike raster ----
-interface RasterRow { popIdx: number; neurons: number[]; spikes: boolean[][]; }
-const RASTER_POPS = ["T4", "T5", "LC", "LPLC", "TmY", "descending"];
-const RASTER_N = 8;
-const RASTER_COLS = 240;
-let rasterRows: RasterRow[] | null = null;
-let rasterCol = 0;
-
-function ensureRaster(): void {
-  if (rasterRows || !brain) return;
-  const net = brain.network;
-  rasterRows = RASTER_POPS.map((p) => {
-    const popIdx = net.populations.indexOf(p);
-    const neurons = popIdx >= 0
-      ? net.indicesOfPop(p, RASTER_N)
-      : [];
-    while (neurons.length < RASTER_N) neurons.push(-1);
-    return { popIdx, neurons, spikes: Array.from({ length: RASTER_N }, () => new Array(RASTER_COLS).fill(false)) };
-  });
-}
-
-function drawRaster(): void {
-  ensureRaster();
-  const c = el("raster") as HTMLCanvasElement;
-  const ctx = c.getContext("2d");
-  if (!ctx) return;
-  ctx.fillStyle = "rgba(4, 8, 10, 0.85)";
-  ctx.fillRect(0, 0, c.width, c.height);
-  if (!rasterRows || !brain) return;
-  const net = brain.network;
-  // record this frame's spikes
-  for (const row of rasterRows) {
-    for (let k = 0; k < row.neurons.length; k++) {
-      const idx = row.neurons[k];
-      row.spikes[k][rasterCol] = idx >= 0 && net.spiked(idx);
-    }
-  }
-  rasterCol = (rasterCol + 1) % RASTER_COLS;
-
-  const rowH = c.height / rasterRows.length;
-  RASTER_POPS.forEach((p, r) => {
-    const y0 = r * rowH;
-    ctx.fillStyle = "rgba(150,190,170,0.55)";
-    ctx.font = "9px monospace";
-    ctx.fillText(p, 4, y0 + rowH / 2 + 3);
-    const row = rasterRows![r];
-    for (let k = 0; k < RASTER_N; k++) {
-      const yy = y0 + (k / RASTER_N) * rowH;
-      for (let ci = 0; ci < RASTER_COLS; ci++) {
-        if (row.spikes[k][ci]) {
-          const x = (ci / RASTER_COLS) * c.width;
-          const fade = ci === (rasterCol - 1 + RASTER_COLS) % RASTER_COLS ? 1 : 0.75;
-          ctx.fillStyle = `rgba(60, 255, 170, ${fade})`;
-          ctx.fillRect(x + 22, yy, 1.4, Math.max(1.2, rowH / RASTER_N - 0.4));
-        }
-      }
-    }
-    ctx.strokeStyle = "rgba(60, 255, 160, 0.08)";
-    ctx.beginPath();
-    ctx.moveTo(0, y0);
-    ctx.lineTo(c.width, y0);
-    ctx.stroke();
-  });
-  // sweep line
-  const sx = (rasterCol / RASTER_COLS) * c.width;
-  ctx.strokeStyle = "rgba(255, 209, 102, 0.5)";
-  ctx.beginPath();
-  ctx.moveTo(sx + 22, 0);
-  ctx.lineTo(sx + 22, c.height);
-  ctx.stroke();
 }
 
 function drawTraces(): void {
@@ -273,6 +281,7 @@ function drawTraces(): void {
   ctx.clearRect(0, 0, c.width, c.height);
   const series: [keyof (typeof traceHist)[0], string][] = [
     ["avert", "#ff7d6b"], ["steer", "#7cf7ff"], ["lift", "#9dff87"], ["thr", "#ffd166"],
+    ["dopa", "#ff4fd8"], ["steerLearn", "#c792ea"],
   ];
   for (const [key, color] of series) {
     ctx.beginPath();
@@ -287,6 +296,20 @@ function drawTraces(): void {
     ctx.stroke();
   }
 }
+
+// eye panel: RGB by default, click to toggle the EMD-flow view
+let eyeShowFlow = false;
+function applyEyeView(): void {
+  (el("eyeLrgb") as HTMLElement).style.display = eyeShowFlow ? "none" : "";
+  (el("eyeL") as HTMLElement).style.display = eyeShowFlow ? "" : "none";
+  const label = document.querySelector(".eye-label");
+  if (label) {
+    label.textContent = "FORWARD EYE · " +
+      (eyeShowFlow ? "EMD flow (click for RGB)" : "RGB · what the brain receives (click for EMD flow)");
+  }
+}
+el("eyeLrgb").addEventListener("click", () => { eyeShowFlow = !eyeShowFlow; applyEyeView(); });
+el("eyeL").addEventListener("click", () => { eyeShowFlow = !eyeShowFlow; applyEyeView(); });
 
 el("startup").addEventListener("click", () => {
   if (started) return;

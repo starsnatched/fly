@@ -41,7 +41,7 @@ function remoteStats(): {
     vy: drone.vel.y,
     clearance: clearanceAhead(drone.pos, drone.yaw),
     collision: false,
-    rgbL: rgb.L, rgbR: rgb.R, // single forward eye; only rgbL is streamed
+    rgbL: rgb.L, rgbR: rgb.R, // stereo pair: both eyes streamed
   };
 }
 
@@ -266,8 +266,8 @@ function updateTelemetry(cmd: ReturnType<RemoteBrain["step"]>): void {
 }
 
 function renderEyePanels(): void {
-  vision.drawEyeCanvas(el("eyeL") as HTMLCanvasElement, "L");
   vision.drawRgbCanvas(el("eyeLrgb") as HTMLCanvasElement, "L");
+  vision.drawRgbCanvas(el("eyeRrgb") as HTMLCanvasElement, "R");
 }
 
 function render(): void {
@@ -296,20 +296,6 @@ function drawTraces(): void {
     ctx.stroke();
   }
 }
-
-// eye panel: RGB by default, click to toggle the EMD-flow view
-let eyeShowFlow = false;
-function applyEyeView(): void {
-  (el("eyeLrgb") as HTMLElement).style.display = eyeShowFlow ? "none" : "";
-  (el("eyeL") as HTMLElement).style.display = eyeShowFlow ? "" : "none";
-  const label = document.querySelector(".eye-label");
-  if (label) {
-    label.textContent = "FORWARD EYE · " +
-      (eyeShowFlow ? "EMD flow (click for RGB)" : "RGB · what the brain receives (click for EMD flow)");
-  }
-}
-el("eyeLrgb").addEventListener("click", () => { eyeShowFlow = !eyeShowFlow; applyEyeView(); });
-el("eyeL").addEventListener("click", () => { eyeShowFlow = !eyeShowFlow; applyEyeView(); });
 
 el("startup").addEventListener("click", () => {
   if (started) return;

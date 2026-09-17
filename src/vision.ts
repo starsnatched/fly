@@ -2,13 +2,13 @@ import * as THREE from "three";
 import type { EyeFlow } from "./types";
 
 /**
- * Vision model — a single forward-facing eye.
+ * Vision model — a stereo pair of forward-facing eyes.
  *
- * One view rendered at RENDER_W x RENDER_H from the drone FPV camera. The
- * FULL-resolution RGB is what streams to the brain backend (the server's
- * hex-consistent sampler takes any client size); inside the brain, the
- * connectome's left/right lamina columns view the left/right HALF of this
- * one frame, so optic-flow differences across the field still steer it.
+ * Two views rendered at RENDER_W x RENDER_H from the drone FPV camera,
+ * yawed ±35° like a compound-eye head. The FULL-resolution RGB per eye is
+ * what streams to the brain backend (eye 0 = left, eye 1 = right; the
+ * server's hex-consistent sampler takes any client size) and the
+ * connectome's left/right lamina columns each view their own eye.
  */
 
 export const GRID_W = 48;
@@ -18,11 +18,11 @@ export const RENDER_H = 108;
 const EMD_DT = 1 / 30; // fly photoreceptor flicker-fusion timescale
 
 export class FlyVision {
-  private rt: THREE.WebGLRenderTarget;
+  private rt: [THREE.WebGLRenderTarget, THREE.WebGLRenderTarget];
   private buf: Uint8Array;
   private eyeL: EyeFlow;
   private eyeR: EyeFlow;
-  /** Full-resolution RGB of the forward eye (0..1, stride 3 = R,G,B) — the
+  /** Full-resolution RGB per eye (0..1, stride 3 = R,G,B) — the
    *  exact bytes streamed to the brain backend. */
   private rgbL: Float32Array;
   private rgbR: Float32Array;
@@ -45,7 +45,7 @@ export class FlyVision {
       rt.texture.colorSpace = THREE.SRGBColorSpace;
       return rt;
     };
-    this.rt = mk();
+    this.rt = [mk(), mk()];
     this.buf = new Uint8Array(RENDER_W * RENDER_H * 4);
 
     const mkFlow = (): EyeFlow => ({
@@ -74,7 +74,7 @@ export class FlyVision {
     return { L: this.rgbL, R: this.rgbR };
   }
 
-  /** Render the forward-eye view from the drone pose, then update EMDs. */
+  /** Render both eye views from the drone pose, then update EMDs. */
   update(
     scene: THREE.Scene,
     basePos: THREE.Vector3,
@@ -83,36 +83,40 @@ export class FlyVision {
     roll: number,
     dt: number,
   ): void {
-    const cam = new THREE.PerspectiveCamera(100, RENDER_W / RENDER_H, 0.1, 600);
-    cam.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, roll, "YXZ"));
-    cam.position.copy(basePos);
-    this.renderer.setRenderTarget(this.rt);
-    this.renderer.clear();
-    this.renderer.render(scene, cam);
-    this.renderer.readRenderTargetPixels(
-      this.rt, 0, 0, RENDER_W, RENDER_H, this.buf,
-    );
-    this.renderer.setRenderTarget(null);
+    for (let eye = 0; eye < 2; eye++) {
+      const side = eye === 0 ? -1 : 1; // L/R mounted ±35°
+      const cam = new THREE.PerspectiveCamera(100, RENDER_W / RENDER_H, 0.1, 600);
+      const e = new THREE.Euler(pitch, yaw + side * (35 * Math.PI / 180), roll, "YXZ");
+      cam.quaternion.setFromEuler(e);
+      cam.position.copy(basePos);
+      this.renderer.setRenderTarget(this.rt[eye]);
+      this.renderer.clear();
+      this.renderer.render(scene, cam);
+      this.renderer.readRenderTargetPixels(
+        this.rt[eye], 0, 0, RENDER_W, RENDER_H, this.buf,
+      );
+      this.renderer.setRenderTarget(null);
 
-    // pass 1: fill the full-resolution RGB buffer (the streamed signal)
-    // pass 2: box-downsample to the GRID_W x GRID_H luminance working grid
-    //         (GL y-flip handled here)
-    {
-      const buf = this.buf;
-      const rgb = this.rgbL;
-      for (let y = 0; y < RENDER_H; y++) {
-        const fy = RENDER_H - 1 - y; // flip to top-down
-        const row = fy * RENDER_W * 4;
-        const outRow = y * RENDER_W * 3;
-        for (let x = 0; x < RENDER_W; x++) {
-          const i = row + x * 4;
-          const o = outRow + x * 3;
-          rgb[o] = buf[i] / 255;
-          rgb[o + 1] = buf[i + 1] / 255;
-          rgb[o + 2] = buf[i + 2] / 255;
+      // pass 1: fill the full-resolution RGB buffer (the streamed signal)
+      // pass 2: box-downsample to the GRID_W x GRID_H luminance working grid
+      //         (GL y-flip handled here)
+      const rgb = eye === 0 ? this.rgbL : this.rgbR;
+      {
+        const buf = this.buf;
+        for (let y = 0; y < RENDER_H; y++) {
+          const fy = RENDER_H - 1 - y; // flip to top-down
+          const row = fy * RENDER_W * 4;
+          const outRow = y * RENDER_W * 3;
+          for (let x = 0; x < RENDER_W; x++) {
+            const i = row + x * 4;
+            const o = outRow + x * 3;
+            rgb[o] = buf[i] / 255;
+            rgb[o + 1] = buf[i + 1] / 255;
+            rgb[o + 2] = buf[i + 2] / 255;
+          }
         }
       }
-      // both flow grids track the same image (left/right halves differ only)
+      const flow = eye === 0 ? this.eyeL : this.eyeR;
       for (let gy = 0; gy < GRID_H; gy++) {
         for (let gx = 0; gx < GRID_W; gx++) {
           const x0 = Math.floor((gx * RENDER_W) / GRID_W);
@@ -127,9 +131,7 @@ export class FlyVision {
               n++;
             }
           }
-          const lum = n ? sum / n / 255 : 0;
-          this.eyeL.lum[gy * GRID_W + gx] = lum;
-          this.eyeR.lum[gy * GRID_W + gx] = lum;
+          flow.lum[gy * GRID_W + gx] = n ? sum / n / 255 : 0;
         }
       }
     }
@@ -325,6 +327,7 @@ export class FlyVision {
   }
 
   dispose(): void {
-    this.rt.dispose();
+    this.rt[0].dispose();
+    this.rt[1].dispose();
   }
 }

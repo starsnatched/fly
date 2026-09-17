@@ -17,7 +17,7 @@
   "autosaveS": 5.0,
   "memoryPath": "state/brain-memory.json",
   "sensors": {
-    "eyes": { "count": 1, "leftId": 0, "rightId": 1 },
+    "eyes": { "count": 2, "leftId": 0, "rightId": 1 },
     "scalarRanges": {
       "altitude": [0.0, 30.0],
       "speed": [0.0, 18.0],

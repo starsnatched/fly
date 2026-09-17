@@ -161,7 +161,8 @@ export class RemoteBrain {
     if (this.sendAccum >= 1 / 30 && this.ws.readyState === WebSocket.OPEN) {
       this.sendAccum = 0;
       const s = this.stats();
-      this.sendEye(0, s.rgbL); // single forward-facing eye
+      this.sendEye(0, s.rgbL); // left eye
+      this.sendEye(1, s.rgbR); // right eye
       this.ws.send(JSON.stringify({
         type: "state", altitude: s.altitude, vy: s.vy,
         clearance: s.clearance, collision: s.collision,
@@ -171,7 +172,7 @@ export class RemoteBrain {
     return this.latest;
   }
 
-  /** Stream the forward-facing eye frame (one frame, not a stereo pair). */
+  /** Stream one eye frame (eye 0 = left, eye 1 = right). */
   private sendEye(eye: number, arr: Float32Array): void {
     const now = performance.now();
     const last = this.lastGrid[eye];

@@ -56,8 +56,10 @@ its actuator/readout anatomy to match — one brain, several bodies.
 **Benchmarks:** `python scripts/rover_bench.py` runs a closed-loop
 obstacle-avoidance benchmark (learn → test with memory → test after wipe,
 reporting impacts / 100 m) against an isolated brain + memory.
-`examples/rover-web/?course=gaps` opens the gap-crossing trial: pits punish
-a fall (−1, soft reset), a clean crossing rewards (+0.6).
+`python scripts/drone_bench.py` does the same for flight: a numeric twin of
+the pillar-field world flies on stereo eye streams (learn → test-mem → wipe →
+test-clean). `examples/rover-web/?course=gaps` opens the gap-crossing trial:
+pits punish a fall (−1, soft reset), a clean crossing rewards (+0.6).
 
 **Talk to the brain yourself** — any WebSocket client works:
 

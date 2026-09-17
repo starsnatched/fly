@@ -146,7 +146,10 @@ same soft bounds and the same rule that a constant situation teaches
 nothing. The learned body map persists in the memory file (`"pools":[…]`)
 alongside the synapse multipliers, survives restarts, and is carried across
 live profile switches. `config/profiles/rover-pools.json` and
-`drone-pools.json` ship as working examples.
+`drone-pools.json` ship as working examples — both verified closed-loop
+(`scripts/rover_bench.py`, `scripts/drone_bench.py`): the learned pool map
+flies the twin drone at 3.9 m/s with 1.71 hits/100 m vs 3.50 after wipe,
+and steers the rover via its motor L/R differential.
 
 Per embodiment (`config/profiles/`): the **drone** declares
 throttle/pitch/roll/yaw; the **rover** declares throttle/steer; the

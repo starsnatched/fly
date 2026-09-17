@@ -117,6 +117,7 @@ export class FlyVision {
         }
       }
       const flow = eye === 0 ? this.eyeL : this.eyeR;
+      const buf = this.buf;
       for (let gy = 0; gy < GRID_H; gy++) {
         for (let gx = 0; gx < GRID_W; gx++) {
           const x0 = Math.floor((gx * RENDER_W) / GRID_W);

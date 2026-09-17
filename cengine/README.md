@@ -27,17 +27,37 @@ Client → server (WS `/stream`):
 - JSON: `{"type":"hello"|"telemetry"|"control"|"reward", ...}`
   - `control`: `{"learning":bool}`, `{"wipe":true}` (reset memory to defaults),
     or `{"memory":{...}}` (import learned weights)
-  - `reward`: `{"value":float}` — external reward injection (R-STDP)
+  - `reward`: `{"value":float}` — external reward bias (see "Self-regulated dopamine")
 
 REST:
 - `GET /health | /telemetry | /actions | /memory`
 - `POST /control` with a JSON body: `{"wipe":true}` (memory → factory defaults,
   also deletes the on-disk memory), `{"learning":false|true}`,
-  `{"reward":-1.0..1.0}` (external reward shaping from any environment)
+  `{"reward":-1.0..1.0}` (external reward bias — DAN excitability, not a
+  direct teaching signal)
 
-Eye configuration (`sensors.eyes.count`): `2` = stereo pair, the connectome's
-left/right lamina columns each view their own camera; `1` = one forward-facing
-camera whose left/right HALVES feed the left/right columns — turning then reads
+## Self-regulated dopamine
+
+The teaching signal is computed **inside the circuit**, not injected:
+
+- DANs are spontaneous pacemakers (`engine.danTonicMv`, ~9 Hz tonic).
+- `dopa = danFastEma − danSlowBaseline` (`engine.dopaGain`,
+  `engine.danBaseTauS`): the DAN population's own deviation from its
+  adapting expectation — a biological prediction error.
+- External signals (open-sky/collision rewards from an embodiment, or
+  `reward` messages) only bias DAN **excitability**. Whether learning
+  happens depends on whether the bias actually moves DAN firing, which the
+  circuit measures itself.
+- A warmup phase gates plasticity until the baseline has converged, so boot
+  transients and regime shifts never register as reward.
+- `POST /control {"wipe":true}` re-warms and zeroes memory; edited
+  synapses remain fully editable forever (soft bounds, no freezing).
+
+Eye configuration (`sensors.eyes.count`): `2` = stereo pair — eye 0 is the
+body's LEFT camera (mounted +35°), eye 1 the RIGHT (−35°), and the
+connectome's left/right lamina columns each view their own camera, so
+binocular flow differences steer directly; `1` = one forward-facing camera
+whose left/right HALVES feed the left/right columns — turning then reads
 optic-flow differences across the field, which is how many insects steer.
 
 Server → client:
@@ -93,8 +113,9 @@ ground steering only. A new body = a new JSON profile.
 - `scripts/e2e_client.py` (protocol test, implementation-agnostic):
   handshake, binary frames, action broadcast, telemetry, control, reward —
   passing against this C server.
-- `scripts/verify_api.py`: 8 s single-eye streaming probe — throttle rides
-  0.27–0.34 around hover (no floor/ceiling relay), yaw spans −0.9…+0.6
-  (saccades + wander + EMD), `POST /control {"wipe":true}` → `memEdited: 0`.
-- Memory stays bounded across sessions: weight spread ~1.0–1.08 after many
-  minutes (prediction-error reward + capped eligibility), no saturation.
+- `scripts/learn_probe.py`: conditioning proof — collision epochs drive
+  dopa negative → internal LTD; open-sky epochs drive dopa positive →
+  ~20k graded re-edits **after a full memory wipe** (soft bounds keep every
+  synapse editable); dopa fluctuates around 0 in steady state (no runaway).
+- Memory stays bounded across sessions (prediction-error dopamine + capped
+  eligibility); telemetry `dopa`/`danBase` expose the internal signal.

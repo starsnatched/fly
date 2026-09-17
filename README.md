@@ -45,7 +45,7 @@ async def main():
                 w, h = 192, 108
                 rgb = bytearray(w * h * 3)           # your camera here
                 await ws.send(struct.pack("<BBHHB", 1, eye, w, h, 3) + rgb)
-            await ws.send(struct.pack("<BBffff", 2, 0, 4.0, 1.0, 0.0, 30.0))
+            await ws.send(struct.pack("<BBffff", 2, 0, 4.0, 3.0, 0.0, 30.0))
             msg = await ws.recv()                    # action frame at 60 Hz
             nl = struct.unpack_from("<H", msg, 1)[0]
             names = json.loads(msg[3:3 + nl])
@@ -63,8 +63,8 @@ for every knob.
 
 | WS `/stream` | direction | format |
 |---|---|---|
-| eye frames | client → brain | `[1][eye][w16][h16][3] + w*h*3 RGB bytes` (any resolution; the brain resamples through the retina's real hex coordinates. One forward eye = send eye 0 only) |
-| body state | client → brain | `[2][flags][alt f32][speed f32][vy f32][clearance f32]` |
+| eye frames | client → brain | `[1][eye][w16][h16][3] + w*h*3 RGB bytes` (any resolution; the brain resamples through the retina's real hex coordinates. Stereo: eye 0 = LEFT camera (+35°), eye 1 = RIGHT (−35°). Single-eye embodiments send eye 0 only) |
+| body state | client → brain | `[2][flags u8][alt f32][speed f32][vy f32][clearance f32]` (flags bit0 = collision) |
 | action frame | brain → client (60 Hz) | `[10][nameLen u16][names JSON][f32 × n]` |
 | JSON | both ways | `hello`, `telemetry`, `control` (learning/wipe/memory), `reward` |
 
@@ -85,7 +85,8 @@ The brain has no idea what body it is flying — that is all config:
   (throttle/pitch/roll/yaw, altitude hold, saccadic flight) and `rover.json`
   (throttle/steer, no altitude) ship as examples. A hexapod, boat, or cursor
   is another JSON file: name your actuator channels, set their ranges/slew,
-  set `sensors.eyes.count` (1 forward camera or a stereo pair), and pick
+  set `sensors.eyes.count` (2 = stereo pair, left eye mounted +35° / right −35°;
+  1 = one forward camera split across the retina's two hemispheres), and pick
   which scalar state you send.
 - The readout maps *neural state → named channels* generically; channels the
   brain does not know stay at their configured default.
@@ -94,10 +95,14 @@ The brain has no idea what body it is flying — that is all config:
   obstacles first decelerate (toward zero tilt), then veer away, and only
   at contact range (<1 m) retreat backwards — so the fly keeps translating
   forward instead of hovering or flying in reverse.
-- **Learning is prediction-error driven**: the dopamine signal is the
-  difference between the current open-sky reward and its running baseline,
-  so a constantly-good situation stops teaching and memory stays sparse,
-  bounded, and meaningful.
+- **Learning is self-regulated**: dopamine is computed *inside* the brain —
+  the DAN population's own firing deviation from its adapting internal
+  baseline (a prediction error). External signals (embodiment rewards,
+  `POST /control {"reward":v}`) only bias DAN excitability; the circuit
+  itself decides whether that counts as teaching. Constant situations stop
+  teaching, boot transients never teach (warmup gating), edited synapses
+  stay editable forever (soft bounds), and `{"wipe":true}` re-warms a
+  clean brain.
 
 ## Architecture
 
@@ -107,8 +112,9 @@ The brain has no idea what body it is flying — that is all config:
   preferred-direction subtypes, dopaminergic reward, R-STDP memory on
   descending synapses, mushroom-body circuit. Details: `cengine/README.md`.
 - **`src/`** — the browser embodiment (three.js): renders the world, captures
-  a **192×108 RGB forward camera**, streams it + proprioception, applies the
-  returned channels to drone physics. Pure sensor/actuator — no neural code.
+  **two 192×108 RGB eye cameras** (±35°, streamed at 30 fps), sends
+  proprioception, applies the returned channels to drone physics. Pure
+  sensor/actuator — no neural code.
 - **`scripts/extract_full_brain.py`** — builds `public/fly-brain-full.bin`
   from the raw connectome, including 2-hop retinotopy inheritance so all
   13,585 T4/T5 columns are located.
@@ -124,4 +130,4 @@ cd cengine && make test                       # engine self-test (EMD steering)
 ## Keys (demo client)
 
 `WASD` nudge · `C` manual override · `R` respawn · `L` toggle learning ·
-`M` wipe memory · click an eye panel to toggle RGB ↔ EMD-flow view.
+`M` wipe memory.

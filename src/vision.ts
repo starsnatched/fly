@@ -84,8 +84,15 @@ export class FlyVision {
     dt: number,
   ): void {
     for (let eye = 0; eye < 2; eye++) {
-      const side = eye === 0 ? -1 : 1; // L/R mounted ±35°
-      const cam = new THREE.PerspectiveCamera(100, RENDER_W / RENDER_H, 0.1, 600);
+      // three.js: +yaw points the camera toward -x = the body's LEFT.
+      // So the LEFT eye (0) mounts at +35deg, the RIGHT eye (1) at -35deg.
+      const side = eye === 0 ? 1 : -1;
+      // Uniform eye optics: horizontal FOV ~90deg (three.js fov is VERTICAL,
+      // so 55deg vertical on the 16:9 render = ~86deg horizontal). Wide
+      // angles (>100 horizontal) stretch the panel edges and make the two
+      // eyes' projections inconsistent with each other and with the FPV.
+      const VFOV = 55;
+      const cam = new THREE.PerspectiveCamera(VFOV, RENDER_W / RENDER_H, 0.1, 600);
       const e = new THREE.Euler(pitch, yaw + side * (35 * Math.PI / 180), roll, "YXZ");
       cam.quaternion.setFromEuler(e);
       cam.position.copy(basePos);

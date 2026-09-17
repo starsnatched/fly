@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
 
 #define MSG_FRAME 1
 #define MSG_STATE 2
@@ -105,6 +106,52 @@ static void http_send(int fd, const char *status, const char *ctype, const char 
                         status, ctype, blen);
     fb_send_all(fd, (const uint8_t *)hdr, (size_t)hlen);
     if (body && blen) fb_send_all(fd, (const uint8_t *)body, (size_t)blen);
+}
+
+/* Stream a whole file (Content-Length + close) — used by GET /brain so a
+ * running instance can hand out the connectome binary itself. */
+static void http_send_file(int fd, const char *path, const char *ctype) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        http_send(fd, "404 Not Found", "application/json",
+                  "{\"error\":\"brain binary not found\"}", 31);
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        http_send(fd, "500 Internal Server Error", "application/json",
+                  "{\"error\":\"unreadable\"}", 20);
+        return;
+    }
+    const char *base = strrchr(path, '/');
+    const char *base2 = strrchr(path, '\\');
+    if (base2 && (!base || base2 > base)) base = base2;
+    base = base ? base + 1 : path;
+    char hdr[320];
+    int hlen = snprintf(hdr, sizeof(hdr),
+                        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\n"
+                        "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                        "Connection: close\r\n\r\n",
+                        ctype, sz, base);
+    if (!fb_send_all(fd, (const uint8_t *)hdr, (size_t)hlen)) {
+        fclose(f);
+        return;
+    }
+    uint8_t chunk[256 * 1024];
+    size_t left = (size_t)sz;
+    while (left > 0) {
+        size_t got = fread(chunk, 1, left < sizeof(chunk) ? left : sizeof(chunk), f);
+        if (got == 0) {
+            if (ferror(f) && errno != EINTR) break;   /* truncated: client hangs up */
+            continue;
+        }
+        if (!fb_send_all(fd, chunk, got)) break;
+        left -= got;
+    }
+    fclose(f);
 }
 
 static void ws_handshake(FbApi *api, int fd, const char *req, size_t reqlen) {
@@ -289,7 +336,8 @@ static void handle_binary_msg(FbApi *api, const uint8_t *data, size_t len) {
 /* ------------------------------------------------------- ws message pump */
 
 /* process all buffered WS messages for a client; consumes from buf */
-#define FB_JSON_MAX 65536  /* max JSON control message (64 KB) */
+#define FB_JSON_MAX (4 * 1024 * 1024)  /* max JSON control message (4 MB —
+                                        * memory restores run a few hundred KB+) */
 #define FB_WS_MSG_MAX (8 * 1024 * 1024) /* max single WS frame (8 MB eye frames) */
 static void ws_process(FbApi *api, WsClient *c, uint8_t *buf, size_t *len) {
     size_t off = 0;
@@ -410,6 +458,10 @@ static void rest_handle(FbApi *api, int fd, const char *req) {
         char *mem = fb_runtime_memory_json(api->rt);
         http_send(fd, "200 OK", "application/json", mem, (int)strlen(mem));
         free(mem);
+    } else if (strcmp(path, "/brain") == 0) {
+        /* the full connectome binary this brain booted from (path is the
+         * engine config's brain.binary); meta json sits next to it */
+        http_send_file(fd, api->cfg->binary, "application/octet-stream");
     } else {
         http_send(fd, "404 Not Found", "application/json", "{\"error\":\"not found\"}", 22);
     }

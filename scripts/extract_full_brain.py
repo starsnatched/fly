@@ -41,8 +41,8 @@ import numpy as np
 from pyarrow import feather
 
 DATA = Path(__file__).parent.parent / "data"
-OUT_BIN = Path(__file__).parent.parent / "public" / "fly-brain-full.bin"
-OUT_META = Path(__file__).parent.parent / "public" / "fly-brain-full.meta.json"
+OUT_BIN = Path(__file__).parent.parent / "data" / "fly-brain-full.bin"
+OUT_META = Path(__file__).parent.parent / "data" / "fly-brain-full.meta.json"
 
 MIN_EDGE_W = 1  # keep every traced synapse
 PLASTIC_K = 128  # strongest inputs per DN kept plastic (R-STDP)

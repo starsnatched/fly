@@ -14,22 +14,12 @@ eye RGB + body state ──WS :8787/stream──▶  C engine
 actuator channels ◀────60 Hz────────────  165,122-neuron LIF connectome
 ```
 
-## Repository layout
+The brain has no idea what body it is flying. It sees eyes and proprioception,
+spikes 165k neurons through the real connectome, and answers with actuator
+channels. What the body *is* — channels, ranges, sensor layout — is a JSON
+profile, negotiated at runtime.
 
-```
-cengine/              the brain: C sources, Dockerfile, engine self-test
-cengine/docker-compose.yml   one-command full stack (brain + example client)
-config/               engine config + embodiment profiles (drone, rover)
-data/                 fly-brain-full.bin — the ~300 MB connectome
-                      (not in git; scripts/extract_full_brain.py rebuilds it)
-examples/drone-web/   example embodiments (three.js): drone + rover clients —
-examples/rover-web/   the only TypeScript in the repo, talks only the API
-scripts/              connectome extractor + protocol test clients +
-                      rover benchmark (rover_bench.py)
-state/                learned weights (created at runtime, not in git)
-```
-
-## Quickstart (C brain API)
+## Quickstart
 
 **With Docker:**
 
@@ -47,137 +37,209 @@ cd examples/drone-web && npm i && npm run dev   # drone client on :5199
 cd examples/rover-web && npm i && npm run dev   # rover client on :5200
 ```
 
-The drone example pairs with the engine's `drone` profile, the rover with
-`rover`. No flag juggling needed: each browser client declares its body in
-the opening `hello` (`{"profile":"rover"}`) and the running brain switches
-its actuator/readout anatomy to match — one brain, several bodies.
-`--profile` still pins a profile at boot if you prefer.
+Open a client and click launch. Each page declares its body in the opening
+`hello` (`{"profile":"rover"}`) and the running brain switches its
+actuator/readout anatomy to match — one brain, several bodies. Append
+`?profile=rover-pools` (or `drone-pools`) to run the direct motor-pool decode
+against the same brain, no restart needed.
 
-**Benchmarks:** `python scripts/rover_bench.py` runs a closed-loop
-obstacle-avoidance benchmark (learn → test with memory → test after wipe,
-reporting impacts / 100 m) against an isolated brain + memory.
-`python scripts/drone_bench.py` does the same for flight: a numeric twin of
-the pillar-field world flies on stereo eye streams (learn → test-mem → wipe →
-test-clean). `examples/rover-web/?course=gaps` opens the gap-crossing trial:
-pits punish a fall (−1, soft reset), a clean crossing rewards (+0.6).
+## Talking to the brain
 
-**Talk to the brain yourself** — any WebSocket client works:
+Everything lives behind one WebSocket (`/stream`) plus a small REST surface.
+Both speak the same protocol as the browser clients — nothing is special
+about them.
+
+### Minimal client
 
 ```python
 import asyncio, json, struct, websockets
 
+W, H = 192, 108   # any resolution works; the brain resamples through the retina
+
+def eye_frame(eye, rgb_bytes):
+    return struct.pack("<BBHHB", 1, eye, W, H, 3) + rgb_bytes   # [1][eye][w][h][3]+RGB
+
+def state_frame(alt, speed, vy, clearance, collision=False):
+    return struct.pack("<BBffff", 2, 1 if collision else 0, alt, speed, vy, clearance)
 
 async def main():
     async with websockets.connect("ws://localhost:8787/stream") as ws:
         await ws.send(json.dumps({"type": "hello"}))
-        print(await ws.recv())  # circuit info
-        while True:
-            for eye in (0, 1):  # one frame per eye
-                w, h = 192, 108
-                rgb = bytearray(w * h * 3)  # your camera here
-                await ws.send(struct.pack("<BBHHB", 1, eye, w, h, 3) + rgb)
-            await ws.send(struct.pack("<BBffff", 2, 0, 4.0, 3.0, 0.0, 30.0))
-            msg = await ws.recv()  # action frame at 60 Hz
-            nl = struct.unpack_from("<H", msg, 1)[0]
-            names = json.loads(msg[3 : 3 + nl])
-            vals = struct.unpack_from("<" + "f" * len(names), msg, 3 + nl)
-            print(dict(zip(names, vals)))  # {"throttle": .., "yaw": ..}
+        print(await ws.recv())                     # circuit info: neurons, edges
 
+        while True:
+            await ws.send(eye_frame(0, bytes(W * H * 3)))    # your camera here
+            await ws.send(state_frame(4.0, 3.0, 0.0, 30.0))
+            msg = await ws.recv()                          # action frame, 60 Hz
+            if not isinstance(msg, bytes):
+                continue                                   # JSON ack/reply
+            nl = struct.unpack_from("<H", msg, 1)[0]
+            names = json.loads(msg[3:3 + nl])
+            vals = struct.unpack_from("<" + "f" * len(names), msg, 3 + nl)
+            print(dict(zip(names, vals)))                  # {"throttle": .., "yaw": ..}
 
 asyncio.run(main())
 ```
 
-## The API
+Run that and you are flying the connectome. `hello` can also declare a body:
+`{"type": "hello", "profile": "rover"}` — or a path to your own profile JSON.
+The reply echoes the applied anatomy (channels, map, pools).
 
-Everything lives behind one WebSocket plus a read-only REST surface.
-See `cengine/README.md` for the full protocol and `config/flybrain.json`
-for every knob.
+### Frame formats
 
-| WS `/stream` | direction | format |
+| message | direction | format |
 |---|---|---|
-| eye frames | client → brain | `[1][eye][w16][h16][3] + w*h*3 RGB bytes` (any resolution; the brain resamples through the retina's real hex coordinates. Stereo: eye 0 = LEFT camera (+35°), eye 1 = RIGHT (−35°). Single-eye embodiments send eye 0 only) |
-| body state | client → brain | `[2][flags u8][alt f32][speed f32][vy f32][clearance f32]` (flags bit0 = collision) |
-| action frame | brain → client (60 Hz) | `[10][nameLen u16][names JSON][f32 × n]` |
-| JSON | both ways | `hello`, `telemetry`, `control` (learning/wipe/memory), `reward` |
+| eye frame | client → brain | `[1 u8][eye u8][w u16][h u16][3 u8] + w*h*3 RGB bytes`. Stereo: eye 0 = LEFT camera (+35°), eye 1 = RIGHT (−35°). Single-eye bodies send eye 0 only — the retina's two hemispheres each view half the image, so turning reads as flow asymmetry. |
+| body state | client → brain | binary `[2 u8][flags u8][alt f32][speed f32][vy f32][clearance f32]` (flags bit0 = collision), or JSON `{"type":"state","altitude":..,"vy":..,"collision":..}` |
+| action frame | brain → client (60 Hz) | `[10 u8][nameLen u16][names as JSON][f32 × n]` — named actuator channels for the negotiated body |
+| JSON | both ways | `hello`, `telemetry`, `control`, `reward` |
 
-| REST `:8788` | returns |
-|---|---|
-| `GET /health` | liveness + client count |
-| `GET /telemetry` | firing rates per group, dopa, memory stats, flow readouts |
-| `GET /actions` | latest actuator channels |
-| `GET /memory` | learned-weight export (R-STDP) |
-| `POST /control` | `{"wipe":true}` reset memory to defaults · `{"learning":bool}` · `{"reward":v}` shape from your environment |
+### Control, reward, telemetry
 
-## Modular & universal
+```python
+await ws.send(json.dumps({"type": "control", "learning": True}))   # toggle R-STDP
+await ws.send(json.dumps({"type": "reward", "value": 0.8}))        # reward pulse
+await ws.send(json.dumps({"type": "control", "wipe": True}))       # factory memory
 
-The brain has no idea what body it is flying — that is all config:
+tel = json.loads(await ws.recv())    # after {"type":"telemetry"}
+# {"neurons":165122,"edges":25542380,"rates":{"T4":5.3,"DAN":9.6,...},
+#  "dopa":0.01,"dnSteer":-0.04,"memEdited":1522,"learning":true,"simMs":2.1}
+```
 
-- **`config/flybrain.json`** — engine, sensors, readout, reward, ports.
-- **`config/profiles/*.json`** — per-embodiment overlays. `drone.json`
-  (throttle/pitch/roll/yaw) and `rover.json` (throttle/steer) ship as
-  examples, plus `drone-pools.json` / `rover-pools.json`, which drive their
-  channels through **direct motor pools** — individual connectome motor
-  neurons whose (plastic, dopamine-learned) spike integrals ARE the raw
-  channel signal. A hexapod, boat, or cursor is another JSON file: name your
-  actuator channels, set their ranges/slew, declare the `readout.map`
-  (which neural population or motor pool drives which channel, with what
-  gain), set `sensors.eyes.count` (2 = stereo pair, left eye mounted +35° /
-  right −35°; 1 = one forward camera split across the retina's two
-  hemispheres), and pick which scalar state you send.
-- The browser clients negotiate their body on connect
-  (`hello {"profile": ...}`); append `?profile=rover-pools` (or
-  `drone-pools`) to the page URL to run the motor-pool decode against the
-  same brain — no server restart needed.
-- The readout maps *neural state → named channels* generically — no scripted
-  behavior, no reflex ladders: vision and touch enter the circuit as neural
-  input, and everything the body does is what the connectome (plus R-STDP
-  memory) does with them. Channels the map does not drive stay at their
-  configured default.
-- **Channel contract (drone):** `throttle` tracks motor-population drive
-  (+ vertical optic flow), `pitch` tracks descending drive, `yaw` and `roll`
-  track descending left/right asymmetry and horizontal optic flow. There are
-  no built-in altitude hold, saccades, or escape sequences — steering away
-  from looming obstacles is a property of the connectome's own T4/T5 → DN
-  wiring, and it can be retrained via R-STDP.
-- **Learning is self-regulated**: dopamine is computed *inside* the brain —
-  the DAN population's own firing deviation from its adapting internal
-  baseline (a prediction error). External signals (embodiment rewards,
-  `POST /control {"reward":v}`) only bias DAN excitability; the circuit
-  itself decides whether that counts as teaching. Constant situations stop
-  teaching, boot transients never teach (warmup gating), edited synapses
-  stay editable forever (soft bounds), and `{"wipe":true}` re-warms a
-  clean brain.
-
-## Architecture
-
-- **`cengine/`** — the native brain service (C). LIF dynamics with per-group
-  biophysics, axonal delays, synaptic depression, retinotopic photoreceptors,
-  frame-locked Hassenstein–Reichardt EMDs on the connectome's real T4/T5
-  preferred-direction subtypes, dopaminergic reward, R-STDP memory on
-  descending synapses, mushroom-body circuit. Details: `cengine/README.md`.
-- **`examples/drone-web/`** — one example embodiment (three.js): renders the
-  world, captures **two 192×108 RGB eye cameras** (±35°, streamed at 30 fps),
-  sends proprioception, applies the returned channels to drone physics.
-  Pure sensor/actuator — no neural code; swap it for your own client.
-- **`examples/rover-web/`** — a second embodiment for the `rover` profile
-  (three.js): a skid-steer desert rover with **one 192×108 forward camera**
-  (streamed at 120 Hz — the retina's left/right hemispheres each view half
-  the image, so turning reads as optic-flow asymmetry), wheel odometry and
-  bumper contacts, applying the returned `throttle`/`steer` channels.
-  Same deal: pure sensor/actuator, no neural code.
-- **`scripts/extract_full_brain.py`** — builds `data/fly-brain-full.bin`
-  from the raw connectome, including 2-hop retinotopy inheritance so all
-  13,585 T4/T5 columns are located.
-- **`scripts/e2e_client.py`** — implementation-agnostic protocol test.
-
-## Verification
+The same actions over REST:
 
 ```bash
-cd cengine && make test                       # engine self-test (EMD steering)
-python scripts/e2e_client.py 8787               # protocol e2e vs the live server
+curl -s localhost:8788/health                 # {"ok":true,"clients":2}
+curl -s localhost:8788/telemetry              # rates per group, dopa, flow readouts
+curl -s localhost:8788/actions                # latest actuator channels
+curl -s localhost:8788/memory > learned.json  # export R-STDP memory (see below)
+curl -X POST localhost:8788/control -d '{"wipe":true}'
+curl -X POST localhost:8788/reward/0.8        # reward; /reward/-1.0 punishes
+```
+
+Learning is self-regulated: dopamine is computed *inside* the brain (the DAN
+population's deviation from its own adapting baseline — a prediction error).
+External rewards only bias DAN excitability; the circuit decides whether that
+counts as teaching. Constant situations stop teaching, boot transients never
+teach, and `wipe` re-warms a clean brain.
+
+### Saving and restoring learned memory
+
+`GET /memory` returns every learned weight — R-STDP synapse multipliers plus
+the plastic motor-pool weights. Send it back to restore:
+
+```python
+mem = json.loads(open("learned.json").read())
+await ws.send(json.dumps({"type": "control", "learning": False}))
+await ws.send(json.dumps({"type": "control", "memory": mem}))
+```
+
+The server acks with `{"type":"memoryApplied","n":44277}` (n = weights
+applied). Turn learning off first if you want the weights to stick verbatim —
+with learning on, an active circuit immediately keeps editing them, which is
+usually what you want.
+
+The server also autosaves to `memoryPath` (`config/flybrain.json`) and reloads
+it on boot, so a demo survives a restart on its own.
+
+## Downloading the full brain data
+
+The connectome binary is ~295 MB (`data/fly-brain-full.bin`, not in git).
+Three ways to get it:
+
+**1. From any running brain** — the server serves the binary it booted from:
+
+```bash
+curl -o fly-brain-full.bin http://localhost:8788/brain
+```
+
+or with progress, or from Python:
+
+```bash
+curl -OJ http://localhost:8788/brain          # ~295 MB, application/octet-stream
+```
+
+```python
+import urllib.request
+urllib.request.urlretrieve("http://localhost:8788/brain", "fly-brain-full.bin")
+```
+
+The little-endian format (`FLYBRAIN1` header, neuron/population/group tables,
+CSR edge arrays) is documented in the docstring of
+`scripts/extract_full_brain.py`; `data/fly-brain-full.meta.json` holds the
+counts and the dataset/license metadata.
+
+**2. Rebuild from the raw connectome** — the extractor reads the MaleCNS
+exports in `data/` (`malecns-connectome.feather`, `malecns-annotations.feather`,
+`neuron-nt.json`, `tbar-nt.feather`) and regenerates the binary, including
+2-hop retinotopy inheritance so all 13,585 T4/T5 columns are located:
+
+```bash
+.venv/Scripts/python scripts/extract_full_brain.py
+```
+
+**3. Just use the repo's copy** — if `data/fly-brain-full.bin` is already on
+disk, the engine loads it at boot (`brain.binary` in `config/flybrain.json`).
+
+## Bodies: one brain, any embodiment
+
+A body is a JSON overlay in `config/profiles/`. `drone.json`
+(throttle/pitch/roll/yaw) and `rover.json` (throttle/steer) ship as examples,
+plus `-pools` variants that drive channels through **direct motor pools** —
+individual connectome motor neurons whose plastic, dopamine-learned spike
+integrals ARE the raw channel signal. A hexapod, boat, or cursor is another
+JSON file:
+
+- name your actuator `channels` (ranges, slew, defaults),
+- declare the `readout.map`: which signal (a population readout like
+  `dnSteer`, `flowRoll`, or a motor pool `pool0` / differential `pool1-pool2`)
+  drives which channel, with what gain,
+- set `sensors.eyes.count` (2 = stereo pair, 1 = forward camera) and which
+  scalar state the body can sense.
+
+The readout maps *neural state → named channels* generically — no scripted
+behavior, no reflex ladders. Steering away from looming obstacles is a
+property of the connectome's own T4/T5 → DN wiring, and it can be retrained
+via R-STDP. Channels the map does not drive stay at their configured default.
+
+## Benchmarks & verification
+
+```bash
+python scripts/rover_bench.py --fresh          # closed-loop driving twin:
+python scripts/drone_bench.py --fresh          #   learn → test-mem → wipe → test-clean,
+                                               #   impacts/100m with vs without memory
+cd cengine && make test                        # engine self-test (EMD steering)
+python scripts/e2e_client.py 8787              # protocol e2e vs the live server
+```
+
+Both benches spawn their own brain on their own ports with their own memory
+file — your demo memory is untouched. The `-pools` benches measure what
+learning is worth: e.g. the drone twin flies 1.71 hits/100 m with learned
+pool weights vs 3.50 after wiping them.
+
+`examples/rover-web/?course=gaps` opens the gap-crossing trial in the browser:
+pits punish a fall (−1, soft reset), a clean crossing rewards (+0.6).
+
+## Repository layout
+
+```
+cengine/              the brain: C sources, Dockerfile, engine self-test
+cengine/docker-compose.yml   one-command full stack (brain + example client)
+config/               engine config + embodiment profiles (drone, rover, -pools)
+data/                 fly-brain-full.bin (~295 MB connectome, not in git) +
+                      raw MaleCNS exports; scripts/extract_full_brain.py
+                      rebuilds the binary from them
+examples/drone-web/   example embodiments (three.js): drone + rover clients —
+examples/rover-web/   the only TypeScript in the repo, talks only the API
+scripts/              connectome extractor, protocol test client, benchmarks
+state/                learned weights (created at runtime, not in git)
 ```
 
 ## Keys (demo clients)
 
 Both examples: `WASD` nudge · `C` manual override · `R` respawn ·
 `L` toggle learning · `M` wipe memory · `U` reward +1 · `J` punish −1.
+
+## Data credit
+
+MaleCNS v1.0 — HHMI Janelia / Google Research, Cell 2026, CC-BY 4.0.

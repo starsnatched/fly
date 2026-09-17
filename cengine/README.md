@@ -34,7 +34,9 @@ Client → server (WS `/stream`):
   - `reward`: `{"value":float}` — external reward bias (see "Self-regulated dopamine")
 
 REST:
-- `GET /health | /telemetry | /actions | /memory`
+- `GET /health | /telemetry | /actions | /memory | /brain` (`/brain` streams
+  the connectome binary the engine booted from, ~295 MB,
+  `Content-Disposition` filename set for `curl -OJ`)
 - `POST /control` with a JSON body: `{"wipe":true}` (memory → factory defaults,
   also deletes the on-disk memory), `{"learning":false|true}`,
   `{"reward":-1.0..1.0}` (external reward bias — DAN excitability, not a

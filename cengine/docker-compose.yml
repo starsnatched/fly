@@ -1,11 +1,11 @@
-# Full-stack deployment: C brain engine + the browser embodiment.
+# Full-stack deployment: the C brain engine + one example embodiment.
 #
-# The browser (vite dev server or any static host) talks to the brain ONLY
-# through the API exposed here: WS :8787/stream (RGB frames in, action
-# frames out) + REST :8788 (telemetry / actions / memory / health).
+# The browser example (examples/drone-web) talks to the brain ONLY through
+# the API exposed here: WS :8787/stream (RGB frames in, action frames out)
+# + REST :8788 (telemetry / actions / memory / health).
 #
-#   docker compose up --build
-#   -> open http://localhost:5199  (client auto-detects ws://localhost:8787)
+#   docker compose -f cengine/docker-compose.yml up --build
+#   -> open http://localhost:5199
 #
 services:
   brain:
@@ -17,11 +17,11 @@ services:
       - "8787:8787"
       - "8788:8788"
     volumes:
-      # connectome binary + config (read-only)
-      - ../public:/data/public:ro
-      - ../config:/data/config:ro
+      # connectome binary + config (read-only), mirroring the repo layout
+      - ../data:/app/data:ro
+      - ../config:/app/config:ro
       # learned weights persist here between runs
-      - ../state:/data/state
+      - ../state:/app/state
     restart: unless-stopped
 
   web:
@@ -32,7 +32,7 @@ services:
     ports:
       - "5199:5199"
     volumes:
-      - ..:/app
+      - ../examples/drone-web:/app
     depends_on:
       - brain
     restart: unless-stopped

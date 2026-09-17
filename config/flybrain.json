@@ -1,6 +1,6 @@
 {
   "engine": {
-    "binary": "public/fly-brain-full.bin",
+    "binary": "data/fly-brain-full.bin",
     "gScale": 0.3,
     "tgtBudget": 36.0,
     "phTonic": 5.0,

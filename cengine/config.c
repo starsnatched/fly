@@ -9,7 +9,7 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
     const FbJson *eng = fb_json_get(root, "engine");
     if (eng) {
         snprintf(cfg->binary, sizeof(cfg->binary), "%s",
-                 fb_json_str(eng, "binary", "public/fly-brain-full.bin"));
+                 fb_json_str(eng, "binary", "data/fly-brain-full.bin"));
         cfg->g_scale = (float)fb_json_num(eng, "gScale", 0.30);
         cfg->tgt_budget = (float)fb_json_num(eng, "tgtBudget", 36.0);
         cfg->ph_tonic = (float)fb_json_num(eng, "phTonic", 5.0);
@@ -113,7 +113,7 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
 int fb_config_load(FbConfig *cfg, const char *path, const char *profile_path) {
     memset(cfg, 0, sizeof(*cfg));
     /* hard defaults (mirroring server/config.json) */
-    snprintf(cfg->binary, sizeof(cfg->binary), "public/fly-brain-full.bin");
+    snprintf(cfg->binary, sizeof(cfg->binary), "data/fly-brain-full.bin");
     cfg->g_scale = 0.30f; cfg->tgt_budget = 36.0f;
     cfg->ph_tonic = 5.0f; cfg->ph_optic_gain = 2.0f; cfg->emd_gain = 10.0f;
     cfg->dan_mod_gain = 0.6f; cfg->learning = 1; cfg->tick_cost_seed_ms = 30.0f;

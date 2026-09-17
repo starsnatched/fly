@@ -14,6 +14,20 @@ eye RGB + body state ──WS :8787/stream──▶  C engine
 actuator channels ◀────60 Hz────────────  165,122-neuron LIF connectome
 ```
 
+## Repository layout
+
+```
+cengine/              the brain: C sources, Dockerfile, engine self-test
+cengine/docker-compose.yml   one-command full stack (brain + example client)
+config/               engine config + embodiment profiles (drone, rover)
+data/                 fly-brain-full.bin — the ~300 MB connectome
+                      (not in git; scripts/extract_full_brain.py rebuilds it)
+examples/drone-web/   one example embodiment: three.js drone client —
+                      the only TypeScript in the repo, talks only the API
+scripts/              connectome extractor + protocol test clients
+state/                learned weights (created at runtime, not in git)
+```
+
 ## Quickstart (C brain API)
 
 **With Docker:**
@@ -27,8 +41,8 @@ docker compose -f cengine/docker-compose.yml up --build
 or `pip install ziglang`):
 
 ```bash
-cd cengine && make run          # brain on :8787 (WS) + :8788 (REST)
-npm install && npm run dev      # demo client on :5199 (streams to the brain)
+cd cengine && make run                          # brain on :8787 (WS) + :8788 (REST)
+cd examples/drone-web && npm i && npm run dev   # example client on :5199
 ```
 
 **Talk to the brain yourself** — any WebSocket client works:
@@ -36,21 +50,23 @@ npm install && npm run dev      # demo client on :5199 (streams to the brain)
 ```python
 import asyncio, json, struct, websockets
 
+
 async def main():
     async with websockets.connect("ws://localhost:8787/stream") as ws:
         await ws.send(json.dumps({"type": "hello"}))
-        print(await ws.recv())                       # circuit info
+        print(await ws.recv())  # circuit info
         while True:
-            for eye in (0, 1):                       # one frame per eye
+            for eye in (0, 1):  # one frame per eye
                 w, h = 192, 108
-                rgb = bytearray(w * h * 3)           # your camera here
+                rgb = bytearray(w * h * 3)  # your camera here
                 await ws.send(struct.pack("<BBHHB", 1, eye, w, h, 3) + rgb)
             await ws.send(struct.pack("<BBffff", 2, 0, 4.0, 3.0, 0.0, 30.0))
-            msg = await ws.recv()                    # action frame at 60 Hz
+            msg = await ws.recv()  # action frame at 60 Hz
             nl = struct.unpack_from("<H", msg, 1)[0]
-            names = json.loads(msg[3:3 + nl])
+            names = json.loads(msg[3 : 3 + nl])
             vals = struct.unpack_from("<" + "f" * len(names), msg, 3 + nl)
-            print(dict(zip(names, vals)))            # {"throttle": .., "yaw": ..}
+            print(dict(zip(names, vals)))  # {"throttle": .., "yaw": ..}
+
 
 asyncio.run(main())
 ```
@@ -111,11 +127,11 @@ The brain has no idea what body it is flying — that is all config:
   frame-locked Hassenstein–Reichardt EMDs on the connectome's real T4/T5
   preferred-direction subtypes, dopaminergic reward, R-STDP memory on
   descending synapses, mushroom-body circuit. Details: `cengine/README.md`.
-- **`src/`** — the browser embodiment (three.js): renders the world, captures
-  **two 192×108 RGB eye cameras** (±35°, streamed at 30 fps), sends
-  proprioception, applies the returned channels to drone physics. Pure
-  sensor/actuator — no neural code.
-- **`scripts/extract_full_brain.py`** — builds `public/fly-brain-full.bin`
+- **`examples/drone-web/`** — one example embodiment (three.js): renders the
+  world, captures **two 192×108 RGB eye cameras** (±35°, streamed at 30 fps),
+  sends proprioception, applies the returned channels to drone physics.
+  Pure sensor/actuator — no neural code; swap it for your own client.
+- **`scripts/extract_full_brain.py`** — builds `data/fly-brain-full.bin`
   from the raw connectome, including 2-hop retinotopy inheritance so all
   13,585 T4/T5 columns are located.
 - **`scripts/e2e_client.py`** — implementation-agnostic protocol test.
@@ -124,7 +140,7 @@ The brain has no idea what body it is flying — that is all config:
 
 ```bash
 cd cengine && make test                       # engine self-test (EMD steering)
-.venv/Scripts/python.exe scripts/e2e_client.py   # protocol e2e vs the live server
+python scripts/e2e_client.py 8787               # protocol e2e vs the live server
 ```
 
 ## Keys (demo client)

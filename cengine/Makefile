@@ -40,7 +40,7 @@ engine-test:
 	./$(TEST)
 
 run: build
-	./$(SERVER) --config ../config/flybrain.json --profile ../config/profiles/drone.json
+	cd .. && ./$(notdir $(SERVER)) --config config/flybrain.json --profile config/profiles/drone.json
 
 test: engine-test
 

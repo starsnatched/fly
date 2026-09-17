@@ -26,7 +26,7 @@ static float *grating(int w, int h, float phase, float yphase) {
 }
 
 int main(int argc, char **argv) {
-    const char *bin = argc > 1 ? argv[1] : "public/fly-brain-full.bin";
+    const char *bin = argc > 1 ? argv[1] : "data/fly-brain-full.bin";
     FbConnectome *c = fb_connectome_load(bin);
     if (!c) return 1;
     FbParams p;

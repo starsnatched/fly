@@ -4,6 +4,7 @@ Protocol-only, so it verifies any conforming implementation.
 
 Usage: .venv/Scripts/python.exe scripts/e2e_client.py [port]
 """
+
 import asyncio
 import json
 import struct
@@ -27,7 +28,7 @@ def state_msg(alt: float = 2.0, clr: float = 30.0, coll: bool = False) -> bytes:
 
 def parse_action_frame(msg: bytes) -> dict:
     nl = struct.unpack_from("<H", msg, 1)[0]
-    names = json.loads(msg[3:3 + nl])
+    names = json.loads(msg[3 : 3 + nl])
     vals = struct.unpack_from("<" + "f" * len(names), msg, 3 + nl)
     return dict(zip(names, map(float, vals)))
 
@@ -40,8 +41,9 @@ async def main() -> int:
     print("health:", health)
 
     ok = False
-    async with websockets.connect(f"ws://localhost:{PORT}/stream",
-                                  max_size=8 * 1024 * 1024) as ws:
+    async with websockets.connect(
+        f"ws://localhost:{PORT}/stream", max_size=8 * 1024 * 1024
+    ) as ws:
         await ws.send(json.dumps({"type": "hello"}))
         hello = json.loads(await asyncio.wait_for(ws.recv(), 10))
         assert hello["type"] == "hello", hello
@@ -54,7 +56,7 @@ async def main() -> int:
         xs = np.arange(w, dtype=np.float32)
         for i in range(90):
             x0 = int((i * 0.04 * w * 8 / 37) % w)
-            lum = (np.full((h, w), 0.35, dtype=np.uint8))
+            lum = np.full((h, w), 0.35, dtype=np.uint8)
             lum[:, (xs.astype(int) + x0) % w < 5] = 255
             rgb = np.repeat(lum[:, :, None], 3, axis=2)
             await ws.send(eye_frame(0, w, h, rgb))
@@ -91,9 +93,16 @@ async def main() -> int:
         tel = await recv_json()
         while tel.get("type") != "telemetry":
             tel = await recv_json()
-        print("telemetry: neurons", tel["neurons"], "edges", tel["edges"],
-              "spikes/tick", tel.get("spikesPerTick"),
-              "dn", round(tel.get("rates", {}).get("descending", 0), 2))
+        print(
+            "telemetry: neurons",
+            tel["neurons"],
+            "edges",
+            tel["edges"],
+            "spikes/tick",
+            tel.get("spikesPerTick"),
+            "dn",
+            round(tel.get("rates", {}).get("descending", 0), 2),
+        )
         assert tel["neurons"] == 165122
 
         # control: enable learning + manual reward pulse
@@ -104,8 +113,12 @@ async def main() -> int:
         tel2 = await recv_json()
         while tel2.get("type") != "telemetry":
             tel2 = await recv_json()
-        print("telemetry after reward: dopa", round(tel2.get("dopa", 0), 3),
-              "learning", tel2.get("learning"))
+        print(
+            "telemetry after reward: dopa",
+            round(tel2.get("dopa", 0), 3),
+            "learning",
+            tel2.get("learning"),
+        )
         assert tel2.get("learning") is True
         ok = True
     print("E2E CLIENT OK" if ok else "E2E CLIENT FAILED")

@@ -13,7 +13,7 @@ keeps EVERY traced neuron and every traced->traced synapse (weight >= 1):
   - a plastic sub-circuit for reward learning: strongest 128 synapses per
     descending neuron (R-STDP memory attaches there)
 
-Output (public/fly-brain-full.bin + .meta.json), little-endian:
+Output (data/fly-brain-full.bin + .meta.json), little-endian:
   header   "FLYBRAIN1" (9 bytes)
   u32      magic 0x4E455552 ('NEUR' little-endian)
   u32      N, u32 E, u32 P (populations), u32 G (groups)
@@ -35,60 +35,86 @@ import json
 import re
 import struct
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-import pyarrow.feather as feather
+from pyarrow import feather
 
 DATA = Path(__file__).parent.parent / "data"
 OUT_BIN = Path(__file__).parent.parent / "public" / "fly-brain-full.bin"
 OUT_META = Path(__file__).parent.parent / "public" / "fly-brain-full.meta.json"
 
-MIN_EDGE_W = 1          # keep every traced synapse
-PLASTIC_K = 128         # strongest inputs per DN kept plastic (R-STDP)
-TOP_INPUTS_CAP = 4096   # safety cap on one neuron's inputs (guards dense hubs)
+MIN_EDGE_W = 1  # keep every traced synapse
+PLASTIC_K = 128  # strongest inputs per DN kept plastic (R-STDP)
+TOP_INPUTS_CAP = 4096  # safety cap on one neuron's inputs (guards dense hubs)
 
 
 # ---- functional groups (drive the biophysics + sensory mapping) ----
 
+
 def group_of(t: str, sc: str) -> str:
-    if re.match(r"^T4", t): return "T4"
-    if re.match(r"^T5", t): return "T5"
-    if re.match(r"^L[1-5]$", t): return "lamina"
-    if re.match(r"^L([6-9]|N|W|U)", t): return "lamina"
-    if re.match(r"^TmY", t): return "TmY"
-    if re.match(r"^Tm", t): return "Tm"
-    if re.match(r"^LPLC", t): return "LPLC"
-    if re.match(r"^LC([0-9]|[A-Z])", t): return "LC"
-    if re.match(r"^LT", t): return "LT"
-    if re.match(r"^(HS|VS|CH|FD|H[12])", t): return "lp-tangential"
-    if re.match(r"^DN", t) or sc == "descending_neuron": return "descending"
-    if re.match(r"^AN", t) or sc == "ascending_neuron": return "ascending"
-    if re.match(r"^(PAM|PPL|PPL1|PPL2|DAN)", t): return "DAN"
-    if re.match(r"^MBON", t): return "MBON"
-    if re.match(r"^(Kenyon|KC)", t) or ("kenyon" in t.lower()): return "KC"
-    if re.match(r"^(aSP|aIP|pC1|vMS|SP-|SIFa|IPN)", t): return "adult-specific"
-    if re.match(r"^vpo", t) or "neck" in t.lower(): return "neck-motor"
-    if sc == "vnc_motor" or sc == "cb_motor": return "motor"
-    if sc == "vnc_sensory" or sc == "cb_sensory" or sc == "ol_sensory": return "sensory"
-    if sc == "visual_projection": return "optic-other"
-    if sc == "visual_centrifugal": return "optic-other"
-    if sc.startswith("ol_"): return "optic-other"
-    if sc.startswith("cb_"): return "central-other"
-    if sc.startswith("vnc_"): return "vnc-other"
+    if re.match(r"^T4", t):
+        return "T4"
+    if re.match(r"^T5", t):
+        return "T5"
+    if re.match(r"^L[1-5]$", t):
+        return "lamina"
+    if re.match(r"^L([6-9]|N|W|U)", t):
+        return "lamina"
+    if re.match(r"^TmY", t):
+        return "TmY"
+    if re.match(r"^Tm", t):
+        return "Tm"
+    if re.match(r"^LPLC", t):
+        return "LPLC"
+    if re.match(r"^LC([0-9]|[A-Z])", t):
+        return "LC"
+    if re.match(r"^LT", t):
+        return "LT"
+    if re.match(r"^(HS|VS|CH|FD|H[12])", t):
+        return "lp-tangential"
+    if re.match(r"^DN", t) or sc == "descending_neuron":
+        return "descending"
+    if re.match(r"^AN", t) or sc == "ascending_neuron":
+        return "ascending"
+    if re.match(r"^(PAM|PPL|PPL1|PPL2|DAN)", t):
+        return "DAN"
+    if re.match(r"^MBON", t):
+        return "MBON"
+    if re.match(r"^(Kenyon|KC)", t) or ("kenyon" in t.lower()):
+        return "KC"
+    if re.match(r"^(aSP|aIP|pC1|vMS|SP-|SIFa|IPN)", t):
+        return "adult-specific"
+    if re.match(r"^vpo", t) or "neck" in t.lower():
+        return "neck-motor"
+    if sc == "vnc_motor" or sc == "cb_motor":
+        return "motor"
+    if sc == "vnc_sensory" or sc == "cb_sensory" or sc == "ol_sensory":
+        return "sensory"
+    if sc == "visual_projection":
+        return "optic-other"
+    if sc == "visual_centrifugal":
+        return "optic-other"
+    if sc.startswith("ol_"):
+        return "optic-other"
+    if sc.startswith("cb_"):
+        return "central-other"
+    if sc.startswith("vnc_"):
+        return "vnc-other"
     return "other"
 
 
 def nt_sign_fallback(t: str) -> int:
     # type-rule: C0/C1/C2... glutamatergic/GABAergic tabs in FlyWire-style naming
-    if re.match(r"^C[0-9]", t): return -1
+    if re.match(r"^C[0-9]", t):
+        return -1
     return +1
 
 
 def dir_of(t: str) -> int:
     m = re.match(r"^T[45]([abcd])", t)
-    if not m: return -1
+    if not m:
+        return -1
     return {"a": 0, "b": 1, "c": 2, "d": 3}[m.group(1)]
 
 
@@ -100,7 +126,7 @@ def write_str32(buf, s: str):
     b = s.encode("utf-8")
     buf += struct.pack("<I", len(b))
     buf += b
-    buf += b"\x00" * ((-len(b)) % 4)   # keep u32/i16/f32 views aligned
+    buf += b"\x00" * ((-len(b)) % 4)  # keep u32/i16/f32 views aligned
 
 
 def pad4(buf, nbytes: int):
@@ -117,7 +143,7 @@ def main():
     df = df.sort_values(idc).reset_index(drop=True)
     n = len(df)
     ids = df[idc].astype("int64").to_numpy()
-    print(f"  traced neurons: {n:,} ({time.time()-t0:.0f}s)")
+    print(f"  traced neurons: {n:,} ({time.time() - t0:.0f}s)")
 
     ty = df["type"].fillna("").astype(str).to_numpy()
     sc = df["superclass"].fillna("").astype(str).to_numpy()
@@ -141,22 +167,31 @@ def main():
         prof = nt_lookup.get(str(nid))
         if prof:
             ach, gaba, glu = prof[0], prof[1], prof[2]
-            if gaba >= 0.5: nt_out[i] = -1
-            elif ach >= 0.5 or glu >= 0.5: nt_out[i] = 1
-            else: nt_out[i] = nt_sign_fallback(t); fallbacks += 1
+            if gaba >= 0.5:
+                nt_out[i] = -1
+            elif ach >= 0.5 or glu >= 0.5:
+                nt_out[i] = 1
+            else:
+                nt_out[i] = nt_sign_fallback(t)
+                fallbacks += 1
             nt_conf[i] = round(max(prof), 3)
         else:
-            nt_out[i] = nt_sign_fallback(t); fallbacks += 1
+            nt_out[i] = nt_sign_fallback(t)
+            fallbacks += 1
     print(f"  NT fallbacks: {fallbacks:,}")
 
     hex1 = df["assignedOlHex1"].to_numpy()
     hex2 = df["assignedOlHex2"].to_numpy()
-    side = np.array([1 if sval(x)[:1] == "R" else 0 for x in df["somaSide"].fillna("")], dtype=np.uint8)
+    side = np.array(
+        [1 if sval(x)[:1] == "R" else 0 for x in df["somaSide"].fillna("")],
+        dtype=np.uint8,
+    )
     dir_out = np.array([dir_of(t) for t in ty], dtype=np.int8)
 
     print("Loading connectome (~1.1 GB)...")
-    e = feather.read_table(DATA / "malecns-connectome.feather",
-                           columns=["body_pre", "body_post", "weight"]).to_pandas()
+    e = feather.read_table(
+        DATA / "malecns-connectome.feather", columns=["body_pre", "body_post", "weight"]
+    ).to_pandas()
     pre = e["body_pre"].astype("int64").to_numpy()
     post = e["body_post"].astype("int64").to_numpy()
     w = e["weight"].fillna(0).astype("int64").to_numpy()
@@ -202,7 +237,9 @@ def main():
         print(f"  T4/T5 hex inheritance: {got:,}/{int(is_t45.sum()):,} neurons")
     hex1, hex2 = hex1f, hex2f
     E = len(pre_m)
-    print(f"  kept {E:,} traced->traced synapses (weight >= {MIN_EDGE_W}) ({time.time()-t0:.0f}s)")
+    print(
+        f"  kept {E:,} traced->traced synapses (weight >= {MIN_EDGE_W}) ({time.time() - t0:.0f}s)"
+    )
 
     # CSR order by source, per-target cap, plastic sub-circuit
     print("Building CSR + caps + plastic subset...")
@@ -223,7 +260,8 @@ def main():
     for tgt in range(n):
         lo, hi = r_ptr[tgt], r_ptr[tgt + 1]
         k = hi - lo
-        if k == 0: continue
+        if k == 0:
+            continue
         if k > TOP_INPUTS_CAP:
             seg = slice(lo, hi)
             w_seg = r_w[seg]
@@ -252,7 +290,9 @@ def main():
     print("Writing binary...")
     plastic_idx = np.nonzero(plastic_mask[final_idx])[0].astype(np.uint32)
     # 12-byte magic keeps every subsequent field 4-byte aligned for JS views
-    header = b"FLYBRAIN1\0\0\0" + struct.pack("<IIIII", 0x4E455552, n, Ef, len(group_names), len(plastic_idx))
+    header = b"FLYBRAIN1\0\0\0" + struct.pack(
+        "<IIIII", 0x4E455552, n, Ef, len(group_names), len(plastic_idx)
+    )
     buf = bytearray(header)
     write_str32(buf, "|".join(group_names))
     buf += grp_arr.tobytes()
@@ -286,7 +326,9 @@ def main():
         "license": "CC-BY 4.0",
     }
     OUT_META.write_text(json.dumps(meta, indent=1))
-    print(f"Wrote {OUT_BIN} ({OUT_BIN.stat().st_size/1e6:.1f} MB) + meta ({time.time()-t0:.0f}s total)")
+    print(
+        f"Wrote {OUT_BIN} ({OUT_BIN.stat().st_size / 1e6:.1f} MB) + meta ({time.time() - t0:.0f}s total)"
+    )
 
 
 if __name__ == "__main__":

@@ -13,8 +13,8 @@ RUN zig cc -O2 \
 FROM alpine:3.20
 WORKDIR /app
 COPY --from=build /out/flybrain-server ./flybrain-server
-# connectome + config live outside the image, bind-mounted at /data
-VOLUME ["/data", "/state"]
+# connectome + config live outside the image, bind-mounted to mirror the repo
+VOLUME ["/app/data", "/app/state"]
 EXPOSE 8787 8788
-# container paths mirror the repo layout: config/, public/, state/
-CMD ["./flybrain-server", "--config", "/data/config/flybrain.json", "--profile", "/data/config/profiles/drone.json"]
+# container paths mirror the repo layout: cengine/ -> /app, config/, data/, state/
+CMD ["./flybrain-server", "--config", "/app/config/flybrain.json", "--profile", "/app/config/profiles/drone.json"]

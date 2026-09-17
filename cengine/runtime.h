@@ -53,11 +53,11 @@ typedef struct {
     double tick_cost_ema;
     double last_wall;
     double mem_timer;
-    double reward_timer;
     int64_t frames;
     int restored;
 
-    /* seed noise only; ALL behavior comes from the circuit's own state */
+    /* seed noise only; ALL behavior comes from the circuit's own state
+     * (the circuit's per-neuron RNG is seeded from this) */
     uint64_t rng;
     float last_turn_cmd;    /* for telemetry */
 

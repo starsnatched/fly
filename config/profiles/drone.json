@@ -1,12 +1,14 @@
 {
   "readout": {
     "dnHzScale": 8.0,
-    "hover": { "throttle": 0.29, "pitch": -0.2 },
-    "cruisePitch": -0.2,
-    "turnGain": 6.0,
-    "optoYawGain": 0.5,
-    "optoFwdGain": 0.12,
-    "optoClimbGain": 0.17
+    "map": [
+      { "channel": "throttle", "signal": "motorDrive", "gain": 1.0 },
+      { "channel": "pitch",    "signal": "dnDrive",    "gain": -0.6, "offset": -0.35 },
+      { "channel": "yaw",      "signal": "dnSteer",    "gain": 1.0 },
+      { "channel": "yaw",      "signal": "flowYaw",    "gain": 0.8 },
+      { "channel": "roll",     "signal": "flowRoll",   "gain": 1.0 },
+      { "channel": "throttle", "signal": "flowPitch",  "gain": 0.35 }
+    ]
   },
   "actuators": {
     "channels": [
@@ -19,7 +21,7 @@
   "sensors": {
     "visionHz": 120,
     "eyes": { "count": 2, "leftId": 0, "rightId": 1 },
-    "touch": { "burstMv": 6.0, "holdMs": 40 },
+    "touch": { "burstMv": 6.0 },
     "scalarRanges": {
       "altitude": [0.0, 30.0],
       "speed": [0.0, 18.0],
@@ -29,7 +31,6 @@
     }
   },
   "reward": {
-    "rewardGain": 0.3,
-    "rewardDecayPerS": 0.8
+    "rewardGain": 0.3
   }
 }

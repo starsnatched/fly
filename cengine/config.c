@@ -5,6 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int parse_map_entry(FbMapEntry *e, const FbJson *m) {
+    snprintf(e->channel, sizeof(e->channel), "%s", fb_json_str(m, "channel", ""));
+    snprintf(e->signal, sizeof(e->signal), "%s", fb_json_str(m, "signal", ""));
+    e->gain = (float)fb_json_num(m, "gain", 0.0);
+    e->offset = (float)fb_json_num(m, "offset", 0.0);
+    return e->channel[0] && e->signal[0];
+}
+
 static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
     const FbJson *eng = fb_json_get(root, "engine");
     if (eng) {
@@ -67,17 +75,15 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
     const FbJson *ro = fb_json_get(root, "readout");
     if (ro) {
         cfg->dn_hz_scale = (float)fb_json_num(ro, "dnHzScale", (double)cfg->dn_hz_scale);
-        const FbJson *hov = fb_json_get(ro, "hover");
-        if (hov) {
-            cfg->hover_throttle = (float)fb_json_num(hov, "throttle", (double)cfg->hover_throttle);
-            cfg->hover_pitch = (float)fb_json_num(hov, "pitch", (double)cfg->hover_pitch);
+        const FbJson *map = fb_json_get(ro, "map");
+        if (map && map->type == FB_JSON_ARR) {
+            int n = map->n > FB_MAX_MAP ? FB_MAX_MAP : map->n;
+            int kept = 0;
+            for (int i = 0; i < n; i++)
+                if (parse_map_entry(&cfg->map[kept], map->items[i])) kept++;
+            /* overlay: a profile with a map REPLACES the base map */
+            cfg->n_map = kept;
         }
-        cfg->alt_damp = (float)fb_json_num(ro, "altDamp", (double)cfg->alt_damp);
-        cfg->cruise_pitch = (float)fb_json_num(ro, "cruisePitch", (double)cfg->cruise_pitch);
-        cfg->turn_gain = (float)fb_json_num(ro, "turnGain", (double)cfg->turn_gain);
-        cfg->opto_yaw_gain = (float)fb_json_num(ro, "optoYawGain", (double)cfg->opto_yaw_gain);
-        cfg->opto_fwd_gain = (float)fb_json_num(ro, "optoFwdGain", (double)cfg->opto_fwd_gain);
-        cfg->opto_climb_gain = (float)fb_json_num(ro, "optoClimbGain", (double)cfg->opto_climb_gain);
     }
 
     const FbJson *act = fb_json_get(root, "actuators");
@@ -99,9 +105,8 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
 
     const FbJson *rew = fb_json_get(root, "reward");
     if (rew) {
-        /* reward PATHWAY knobs only — there is no reward shaping anywhere */
+        /* reward PATHWAY knob only — there is no reward shaping anywhere */
         cfg->reward_gain = (float)fb_json_num(rew, "rewardGain", (double)cfg->reward_gain);
-        cfg->reward_decay_per_s = (float)fb_json_num(rew, "rewardDecayPerS", (double)cfg->reward_decay_per_s);
     }
     const FbJson *net = fb_json_get(root, "network");
     if (net) {
@@ -120,7 +125,7 @@ int fb_config_load(FbConfig *cfg, const char *path, const char *profile_path) {
     cfg->dopa_gain = 0.09f; cfg->dan_base_tau_s = 8.0f; cfg->dan_tonic_mv = 3.0f;
     cfg->sim_speed = 1.0f; cfg->max_bio_ms = 20.0f;
     cfg->autosave_s = 5.0f;
-    cfg->reward_gain = 0.30f; cfg->reward_decay_per_s = 0.8f;
+    cfg->reward_gain = 0.30f;
     snprintf(cfg->memory_path, sizeof(cfg->memory_path), "state/brain-memory.json");
     cfg->eye_count = 2;
     cfg->eye_left_id = 0; cfg->eye_right_id = 1;
@@ -131,10 +136,8 @@ int fb_config_load(FbConfig *cfg, const char *path, const char *profile_path) {
     cfg->range_clr[0] = 0; cfg->range_clr[1] = 60;
     cfg->tau_scale = 9.0f;
     cfg->touch_gain = 6.0f;
-    cfg->dn_hz_scale = 8.0f; cfg->hover_throttle = 0.29f; cfg->hover_pitch = -0.2f;
-    cfg->alt_damp = 1.2f;
-    cfg->cruise_pitch = -0.2f; cfg->turn_gain = 6.0f;
-    cfg->opto_yaw_gain = 0.5f; cfg->opto_fwd_gain = 0.12f; cfg->opto_climb_gain = 0.17f;
+    cfg->dn_hz_scale = 8.0f;
+    cfg->n_map = 0;
     cfg->n_channels = 4;
     snprintf(cfg->channels[0], 32, "throttle");
     snprintf(cfg->channels[1], 32, "pitch");

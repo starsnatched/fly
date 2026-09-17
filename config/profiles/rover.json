@@ -1,9 +1,12 @@
 {
   "readout": {
     "dnHzScale": 8.0,
-    "turnGain": 6.0,
-    "optoYawGain": 0.5,
-    "optoFwdGain": 0.12
+    "map": [
+      { "channel": "throttle", "signal": "motorDrive", "gain": 1.0 },
+      { "channel": "steer",    "signal": "dnSteer",    "gain": 1.0 },
+      { "channel": "steer",    "signal": "flowYaw",    "gain": 0.8 },
+      { "channel": "throttle", "signal": "flowPitch",  "gain": 0.35 }
+    ]
   },
   "actuators": {
     "channels": [
@@ -14,7 +17,7 @@
   "sensors": {
     "visionHz": 120,
     "eyes": { "count": 1, "leftId": 0, "rightId": 1 },
-    "touch": { "burstMv": 6.0, "holdMs": 40 },
+    "touch": { "burstMv": 6.0 },
     "scalarRanges": {
       "altitude": [0.0, 1.0],
       "speed": [0.0, 4.0],
@@ -24,7 +27,6 @@
     }
   },
   "reward": {
-    "rewardGain": 0.3,
-    "rewardDecayPerS": 0.8
+    "rewardGain": 0.3
   }
 }

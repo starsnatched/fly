@@ -1,8 +1,20 @@
-/* Server config (JSON), mirroring config/flybrain.json + profiles/*.json. */
+/* Server config (JSON), mirroring config/flybrain.json + profiles. */
 #ifndef FB_CONFIG_H
 #define FB_CONFIG_H
 
 #include "json.h"
+
+/* One decode-map entry: channel = offset + gain * signal. The set of
+ * signals is fixed (population readouts from circuit.h's decoders); which
+ * population feeds which actuator name is per-embodiment DECLARATION in
+ * config (readout.map) — anatomy, not policy. */
+typedef struct {
+    char channel[32];
+    char signal[32];
+    float gain, offset;
+} FbMapEntry;
+
+#define FB_MAX_MAP 32
 
 typedef struct {
     /* engine */
@@ -24,25 +36,20 @@ typedef struct {
     /* mechanosensory (touch/collision) pathway */
     float touch_gain;         /* burst amplitude in mV of extra sensory current
                                  (decays with ~40 ms receptor kinetics) */
-    /* readout: embodiment channel SEMANTICS + optomotor reflex gains only.
-     * All behavior originates in the circuit (EMD flow, DN steering, R-STDP
-     * memory); these knobs shape how neural state maps onto actuator names. */
+    /* readout: DN rate normalization + the DECLARED decode map
+     * (readout.map[]). There are no behavioral knobs: all behavior is the
+     * circuit's own; the map only says which population a channel listens
+     * to and how loudly (channel = offset + gain*signal). */
     float dn_hz_scale;
-    float hover_throttle, hover_pitch;
-    float alt_damp;           /* body-rate damping from the body's own IMU */
-    float cruise_pitch;       /* forward tilt at full brain drive */
-    float turn_gain;          /* DN/EMD turn signal -> yaw channel gain */
-    float opto_yaw_gain;      /* whole-field horizontal flow -> gaze stabilization */
-    float opto_fwd_gain;      /* whole-field flow -> forward-speed regulation */
-    float opto_climb_gain;    /* vertical flow -> climb response (height control) */
+    FbMapEntry map[FB_MAX_MAP];
+    int n_map;
     /* actuators (channel order matters: it defines the WS action frame) */
     char channels[8][32];
     float ch_lo[8], ch_hi[8], ch_slew[8], ch_default[8];
     int n_channels;
     /* reward pathway (NO reward shaping: only how /reward scales into the
-     * DAN excitability input and how fast that input decays) */
+     * DAN excitability input; the bias decays inside the circuit) */
     float reward_gain;        /* /reward v -> DAN bias v*reward_gain */
-    float reward_decay_per_s; /* decay of the DAN bias (pulse semantics) */
     /* network */
     int ws_port, rest_port;
 } FbConfig;

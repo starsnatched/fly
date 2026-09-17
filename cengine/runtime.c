@@ -168,15 +168,20 @@ static void readout_compute(FbRuntime *rt, float *out /* n_channels */) {
     sig[SIG_TOUCH] = cfg->touch_gain > 0.0f
         ? clampf(net->touch_blast_mV / cfg->touch_gain, 0.0f, 1.0f) : 0.0f;
 
-    /* ---- the declared decode map: population -> channel ---- */
+    /* ---- the declared decode map: population -> channel ----
+     * Entries name a SIGNAL (a population readout above) and a CHANNEL
+     * (an actuator from the profile); channel = offset + gain*signal.
+     * Unknown names are skipped, never invented. */
     float yaw_cmd = 0.0f;
     for (int m = 0; m < cfg->n_map; m++) {
         const FbMapEntry *e = &cfg->map[m];
+        int s = signal_index(e->signal);
+        if (s < 0) continue;
         int ch = -1;
         for (int i = 0; i < rt->n_channels; i++)
             if (strcmp(rt->ch[i].name, e->channel) == 0) { ch = i; break; }
         if (ch < 0) continue;
-        out[ch] += e->offset + e->gain * sig[e->signal];
+        out[ch] += e->offset + e->gain * sig[s];
     }
     /* clamp here too; actuators_apply applies the channel slew after */
     for (int i = 0; i < rt->n_channels; i++) {
@@ -336,6 +341,10 @@ FbRuntime *fb_runtime_new(const FbConfig *cfg) {
     for (int i = 0; i < 8; i++) {
         rt->rng ^= rt->rng << 13; rt->rng ^= rt->rng >> 7; rt->rng ^= rt->rng << 17;
     }
+    /* hand the runtime's seed to the circuit so there is one noise source,
+     * inside the brain — nothing behavioral is seeded here */
+    rt->net->rng_s0 ^= rt->rng;
+    rt->net->rng_s1 ^= ~rt->rng;
     rt->last_turn_cmd = 0.0f;
     sensors_init(&rt->sens);
     rt->frames = 0;

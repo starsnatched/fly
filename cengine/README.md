@@ -11,7 +11,7 @@ neuroscience happens here.
 |---|---|
 | `flybrain.c` | FLYBRAIN1 connectome loader (4-byte-aligned sections, LE) |
 | `circuit.c`  | LIF engine: per-group biophysics, per-target in-degree normalization, CSR delivery, axonal delays, Tsodyks-Markram depression, retinotopic photoreceptors, **frame-locked Hassenstein–Reichardt T4/T5 EMDs** on real preferred-direction subtypes, DAN neuromodulation, dopamine-gated R-STDP + Turrigiano scaling |
-| `runtime.c`  | tick loop (adaptive bio-budget), lock-free frame coalescing, gait readout (altitude hold, obstacle avoidance, spontaneous saccades + heading wander), memory persistence |
+| `runtime.c`  | tick loop (adaptive bio-budget), lock-free frame coalescing, neural readout (declared decode map only — no scripted behavior), memory persistence |
 | `api.c`      | WebSocket `/stream` (binary eye frames in, action frames out at 60 Hz) + REST `/telemetry /actions /memory /health` |
 | `config.c`   | JSON config + embodiment profiles (`config/flybrain.json`, `config/profiles/*.json`) |
 | `engine_test.c` | in-process self-test: directional selectivity + symmetry on the real connectome |
@@ -88,23 +88,30 @@ docker compose -f cengine/docker-compose.yml up --build
 
 ## Readout: neural state → actuator channels
 
-The readout is generic: it computes a small set of neural signals and maps
-them onto **whatever channels the profile names** (`throttle`, `pitch`,
-`roll`, `yaw`, `steer`, …). Unknown channels hold their configured default.
-All gains live in the config's `readout` block.
+The readout computes NO behavior. Every signal is a population activity
+INSIDE the circuit — the same thing an electrophysiologist would decode from
+descending neurons and the optic lobe. Which population feeds which actuator
+channel is a per-embodiment DECLARATION in config (`readout.map`): each entry
+is `{ "channel", "signal", "gain", "offset" }` with
+`channel = offset + gain · signal`, summed over entries, then clamped to the
+channel's range and slewed. Unknown signals or channels are skipped, never
+invented. A new body = a new JSON profile: name its channels, declare the map.
 
 | signal | source |
 |---|---|
-| `drive` | DN + motor group firing rates (arousal) |
-| `avoid` | `tanh(turnGain · (flowR − flowL))` — steer away from the eye with more optic flow |
-| `v_flow` | vertical EMD bias — ground expanding → climb |
-| saccades | spontaneous, rate `saccadeRate`/s (real flies interleave straight flight with rapid turns) |
-| `wander_bias` | Ornstein–Uhlenbeck heading set point (`wanderTau`, `wanderAmp`) |
-| altitude hold | climb set point `altGain·(targetAlt − alt) − altDamp·vy` |
+| `dnDrive` | descending-population firing rate (normalized by `dnHzScale`) |
+| `motorDrive` | motor-population firing rate (normalized) |
+| `dnSteer` | left-vs-right descending rate asymmetry (−1..1) |
+| `flowYaw` | T4/T5 horizontal optic flow, right-vs-left difference |
+| `flowRoll` | T4/T5 whole-field horizontal flow (optic-lobe consensus) |
+| `flowPitch` | T4/T5 vertical flow (optic-lobe consensus) |
+| `touch` | mechanosensory burst envelope (0..1) |
 
-Per embodiment (`config/profiles/`): the **drone** gets throttle/pitch/roll/yaw
-with altitude hold and saccadic flight; the **rover** gets throttle/steer with
-ground steering only. A new body = a new JSON profile.
+Per embodiment (`config/profiles/`): the **drone** declares
+throttle/pitch/roll/yaw; the **rover** declares throttle/steer. Gains in the
+map shape how strongly a population drives a channel — they are anatomy
+annotations, not behavioral controllers: all behavior originates in the
+circuit (EMD flow, DN steering, R-STDP memory) and its own dopamine.
 
 ## Verified
 

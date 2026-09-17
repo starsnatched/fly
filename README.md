@@ -98,19 +98,24 @@ The brain has no idea what body it is flying — that is all config:
 
 - **`config/flybrain.json`** — engine, sensors, readout, reward, ports.
 - **`config/profiles/*.json`** — per-embodiment overlays. `drone.json`
-  (throttle/pitch/roll/yaw, altitude hold, saccadic flight) and `rover.json`
-  (throttle/steer, no altitude) ship as examples. A hexapod, boat, or cursor
-  is another JSON file: name your actuator channels, set their ranges/slew,
-  set `sensors.eyes.count` (2 = stereo pair, left eye mounted +35° / right −35°;
+  (throttle/pitch/roll/yaw) and `rover.json` (throttle/steer) ship as
+  examples. A hexapod, boat, or cursor is another JSON file: name your
+  actuator channels, set their ranges/slew, declare the `readout.map`
+  (which neural population drives which channel, with what gain), set
+  `sensors.eyes.count` (2 = stereo pair, left eye mounted +35° / right −35°;
   1 = one forward camera split across the retina's two hemispheres), and pick
   which scalar state you send.
-- The readout maps *neural state → named channels* generically; channels the
-  brain does not know stay at their configured default.
-- **Channel contract (drone):** `pitch < 0` tilts forward (translation),
-  `yaw` reorients, `roll` strafes. Flight is cruise-dominant: looming
-  obstacles first decelerate (toward zero tilt), then veer away, and only
-  at contact range (<1 m) retreat backwards — so the fly keeps translating
-  forward instead of hovering or flying in reverse.
+- The readout maps *neural state → named channels* generically — no scripted
+  behavior, no reflex ladders: vision and touch enter the circuit as neural
+  input, and everything the body does is what the connectome (plus R-STDP
+  memory) does with them. Channels the map does not drive stay at their
+  configured default.
+- **Channel contract (drone):** `throttle` tracks motor-population drive
+  (+ vertical optic flow), `pitch` tracks descending drive, `yaw` and `roll`
+  track descending left/right asymmetry and horizontal optic flow. There are
+  no built-in altitude hold, saccades, or escape sequences — steering away
+  from looming obstacles is a property of the connectome's own T4/T5 → DN
+  wiring, and it can be retrained via R-STDP.
 - **Learning is self-regulated**: dopamine is computed *inside* the brain —
   the DAN population's own firing deviation from its adapting internal
   baseline (a prediction error). External signals (embodiment rewards,

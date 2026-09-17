@@ -1,112 +1,127 @@
-# FlyBrain FPV 🪰🎮
+# FlyBrain — a fruit-fly brain as an API
 
-**A quadcopter in a browser, flown by a circuit of real neurons extracted from the
-male fruit-fly brain connectome (MaleCNS v1.0).**
-
-Inspired by the "fly controls an FPV drone" demos — but the wiring here is not
-hand-made: it comes from the complete electron-microscopy connectome of an adult
-male *Drosophila* central nervous system, published by HHMI Janelia / Google
-Research in *Cell* (Berg et al., 2026), licensed CC-BY 4.0.
-
-![pipeline](docs/pipeline.svg)
-
-## How it works
+The **entire traced MaleCNS v1.0 male fruit-fly CNS** (Janelia/Google, Cell
+2026 — CC-BY) — **165,122 spiking neurons wired by 25.5M real connectome
+synapses** — runs as a standalone C service. Any client that can send eye
+images and body state can use it: a drone in a browser, a rover, a robot arm,
+a headless benchmark.
 
 ```
-WebGL scene (FPV camera, 2 eyes at ±35°)
-   └─ 96×54 render per eye → 48×27 luminance grid
-        └─ Hassenstein–Reichardt elementary motion detectors  (≈ T4/T5)
-             └─ central dark-fraction + growth = looming       (≈ LPLC2)
-                  └─ 20,461 spiking LIF neurons, 12 populations
-                     (lamina → Tm/TmY → T4/T5 → LC/LPLC/LT → DNs)
-                     wiring = 343,241 REAL per-neuron connectome edges
-                        └─ descending-neuron pools → throttle/pitch/roll/yaw
-                             └─ quadrotor physics → dodge or bump
+eye RGB + body state ──WS :8787/stream──▶  C engine
+                                           retinotopic photoreceptors
+                                           T4/T5 motion detectors (EMDs)
+                                           DAN reward + R-STDP memory
+actuator channels ◀────60 Hz────────────  165,122-neuron LIF connectome
 ```
 
-- **Vision** — two eye renders per frame, downsampled, run through
-  Hassenstein–Reichardt EMDs (the canonical fly motion detector).
-- **Looming detection** — the fly's escape trigger: angular size of the nearest
-  dark silhouette *and* its growth above an adapted baseline. Saccades suppress
-  detection mid-turn and reset adaptation afterwards (post-saccadic reset).
-- **Brain** — a **spiking leaky integrate-and-fire** network: every one of the
-  20,461 neurons has its own membrane voltage, threshold, refractory period,
-  and spikes. Synapses are exponential-decay conductances delivered through
-  343,241 real connectome edges (weights = per-target K-max-normalized synapse
-  counts; signs from per-neuron neurotransmitter probabilities aggregated from
-  **45.7M real T-bars** — 18% of circuit neurons are GABAergic/inhibitory,
-  peaking at 32% in the `inter` population; mean NT confidence 87%). Sensory
-  drive injects current per population; T4/T5 additionally get direction-tuned
-  EMD current (real a/b/c/d directional subtypes from the data). A saturating
-  feedback-inhibition pool keeps recurrent excitation in the fluctuation-driven
-  regime (~1-8 Hz spontaneous, bursts on looming).
-- **Readout** — descending-neuron pools: `avert` (LPLC-driven escape), `steer`
-  (lateral flow asymmetry), `lift` (PD altitude hold near 2 m). Looming
-  triggers a rapid **body saccade** away from the threat — the fly's own
-  collision-avoidance maneuver.
-- **Physics** — simple quadrotor model: thrust along body-up, drag, tilt-based
-  acceleration, ground/ceiling clamps, capsule-vs-obstacle collisions.
+## Quickstart (C brain API)
 
-## The data
-
-| file | rows | what |
-|---|---|---|
-| `body-annotations-male-cns-v1.0-minconf-0.5.feather` | 211,577 neurons | type, superclass, side, status |
-| `connectome-weights-male-cns-v1.0-minconf-0.5.feather` | 151,856,684 edges | neuron→neuron synapse counts |
-
-`scripts/extract_lif_circuit.py` (Python + pyarrow):
-
-1. Filters to `status == "Traced"` (165,122 neurons).
-2. Seeds = T4/T5 (13,585) + `visual_projection` (9,201); targets = 1,360 DNs.
-3. Keeps neurons on a **seed→DN path of length ≤ 3** via CSR BFS (79,066 survive).
-4. Assigns populations, caps sprawling classes, prunes edges per target.
-5. Merges per-neuron neurotransmitter profiles from `data/neuron-nt.json`
-   (`scripts/aggregate_nt.py`), real T4/T5 a/b/c/d directional subtypes, and
-   hex retinotopy where available.
-6. Emits `public/fly-lif.json` (~5 MB): 20,461 neurons with per-neuron NT
-   sign + confidence, and 343,241 per-neuron edges as flat triplets.
-
-Reproduce:
+**With Docker:**
 
 ```bash
-python -m venv .venv
-.venv/Scripts/pip install pyarrow numpy pandas      # (Linux/macOS: .venv/bin/pip)
-.venv/Scripts/python scripts/aggregate_nt.py           # optional: real NT signs (2.7 GB download)
-.venv/Scripts/python scripts/extract_lif_circuit.py    # downloads ~1 GB, then extracts
-npm install
-npm run dev
+docker compose -f cengine/docker-compose.yml up --build
+# brain: ws://localhost:8787/stream + REST :8788 · client: http://localhost:5199
 ```
 
-## Controls
+**Without Docker** (only toolchain dependency: [zig](https://ziglang.org),
+or `pip install ziglang`):
 
-| key | action |
+```bash
+cd cengine && make run          # brain on :8787 (WS) + :8788 (REST)
+npm install && npm run dev      # demo client on :5199 (streams to the brain)
+```
+
+**Talk to the brain yourself** — any WebSocket client works:
+
+```python
+import asyncio, json, struct, websockets
+
+async def main():
+    async with websockets.connect("ws://localhost:8787/stream") as ws:
+        await ws.send(json.dumps({"type": "hello"}))
+        print(await ws.recv())                       # circuit info
+        while True:
+            for eye in (0, 1):                       # one frame per eye
+                w, h = 192, 108
+                rgb = bytearray(w * h * 3)           # your camera here
+                await ws.send(struct.pack("<BBHHB", 1, eye, w, h, 3) + rgb)
+            await ws.send(struct.pack("<BBffff", 2, 0, 4.0, 1.0, 0.0, 30.0))
+            msg = await ws.recv()                    # action frame at 60 Hz
+            nl = struct.unpack_from("<H", msg, 1)[0]
+            names = json.loads(msg[3:3 + nl])
+            vals = struct.unpack_from("<" + "f" * len(names), msg, 3 + nl)
+            print(dict(zip(names, vals)))            # {"throttle": .., "yaw": ..}
+
+asyncio.run(main())
+```
+
+## The API
+
+Everything lives behind one WebSocket plus a read-only REST surface.
+See `cengine/README.md` for the full protocol and `config/flybrain.json`
+for every knob.
+
+| WS `/stream` | direction | format |
+|---|---|---|
+| eye frames | client → brain | `[1][eye][w16][h16][3] + w*h*3 RGB bytes` (any resolution; the brain resamples through the retina's real hex coordinates. One forward eye = send eye 0 only) |
+| body state | client → brain | `[2][flags][alt f32][speed f32][vy f32][clearance f32]` |
+| action frame | brain → client (60 Hz) | `[10][nameLen u16][names JSON][f32 × n]` |
+| JSON | both ways | `hello`, `telemetry`, `control` (learning/wipe/memory), `reward` |
+
+| REST `:8788` | returns |
 |---|---|
-| click | launch |
-| `W A S D` | nudge thrust |
-| `C` | toggle manual override |
-| `R` | respawn |
+| `GET /health` | liveness + client count |
+| `GET /telemetry` | firing rates per group, dopa, memory stats, flow readouts |
+| `GET /actions` | latest actuator channels |
+| `GET /memory` | learned-weight export (R-STDP) |
+| `POST /control` | `{"wipe":true}` reset memory to defaults · `{"learning":bool}` · `{"reward":v}` shape from your environment |
 
-## Files
+## Modular & universal
 
-- `src/vision.ts` — compound eyes + EMDs + looming readout
-- `src/lif.ts` — spiking LIF engine (per-neuron Vm, spikes, exponential synapses)
-- `src/lifbrain.ts` — LIF controller (sensory drive → ticks → pool readout)
-- `src/shared.ts` — shared looming / saccade / wander / command circuit
-- `src/drone.ts` — quadrotor physics
-- `src/world.ts` — obstacle world generation + collision queries
-- `src/main.ts` — glue: loop, cameras, HUD, spike raster
-- `scripts/extract_lif_circuit.py` — connectome → per-neuron LIF circuit JSON
-  (hex retinotopy, T4/T5 directional subtypes, real NT signs)
-- `scripts/aggregate_nt.py` — stream 45.7M T-bar NT probabilities →
-  per-neuron mean profiles (`data/neuron-nt.json`)
+The brain has no idea what body it is flying — that is all config:
 
-## Credits & license
+- **`config/flybrain.json`** — engine, sensors, readout, reward, ports.
+- **`config/profiles/*.json`** — per-embodiment overlays. `drone.json`
+  (throttle/pitch/roll/yaw, altitude hold, saccadic flight) and `rover.json`
+  (throttle/steer, no altitude) ship as examples. A hexapod, boat, or cursor
+  is another JSON file: name your actuator channels, set their ranges/slew,
+  set `sensors.eyes.count` (1 forward camera or a stereo pair), and pick
+  which scalar state you send.
+- The readout maps *neural state → named channels* generically; channels the
+  brain does not know stay at their configured default.
+- **Channel contract (drone):** `pitch < 0` tilts forward (translation),
+  `yaw` reorients, `roll` strafes. Flight is cruise-dominant: looming
+  obstacles first decelerate (toward zero tilt), then veer away, and only
+  at contact range (<1 m) retreat backwards — so the fly keeps translating
+  forward instead of hovering or flying in reverse.
+- **Learning is prediction-error driven**: the dopamine signal is the
+  difference between the current open-sky reward and its running baseline,
+  so a constantly-good situation stops teaching and memory stays sparse,
+  bounded, and meaningful.
 
-- Connectome data: **MaleCNS v1.0**, FlyEM team @ HHMI Janelia, Google Research,
-  and collaborators — [male-cns.janelia.org](https://male-cns.janelia.org/) —
-  **CC-BY 4.0**. Citation: Berg et al., *"Sexual dimorphism in the complete
-  connectome of the Drosophila male central nervous system"*, Cell (2026).
-- Modeling conventions follow the connectome-constrained LIF approach of
-  Shiu et al. 2024 (signs of influence are a modeling choice; magnitudes and
-  topology are the data's).
-- Code in this repo: MIT.
+## Architecture
+
+- **`cengine/`** — the native brain service (C). LIF dynamics with per-group
+  biophysics, axonal delays, synaptic depression, retinotopic photoreceptors,
+  frame-locked Hassenstein–Reichardt EMDs on the connectome's real T4/T5
+  preferred-direction subtypes, dopaminergic reward, R-STDP memory on
+  descending synapses, mushroom-body circuit. Details: `cengine/README.md`.
+- **`src/`** — the browser embodiment (three.js): renders the world, captures
+  a **192×108 RGB forward camera**, streams it + proprioception, applies the
+  returned channels to drone physics. Pure sensor/actuator — no neural code.
+- **`scripts/extract_full_brain.py`** — builds `public/fly-brain-full.bin`
+  from the raw connectome, including 2-hop retinotopy inheritance so all
+  13,585 T4/T5 columns are located.
+- **`scripts/e2e_client.py`** — implementation-agnostic protocol test.
+
+## Verification
+
+```bash
+cd cengine && make test                       # engine self-test (EMD steering)
+.venv/Scripts/python.exe scripts/e2e_client.py   # protocol e2e vs the live server
+```
+
+## Keys (demo client)
+
+`WASD` nudge · `C` manual override · `R` respawn · `L` toggle learning ·
+`M` wipe memory · click an eye panel to toggle RGB ↔ EMD-flow view.

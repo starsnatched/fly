@@ -137,24 +137,51 @@ enum {
     SIG_COUNT
 };
 
+/* SIG_POOL0+p (p < 8): direct motor-pool integrals (readout.pools). A pool
+ * signal is NOT a population average — it is the leaky sum of individual
+ * member-neuron spikes (plastic when learn:true), i.e. the neuron-level
+ * decode itself. A map entry wires it to an actuator like any signal:
+ *   { "channel": "throttle", "signal": "pool0", "gain": .., "offset": .. }
+ * Population signals and pool signals can be mixed freely in one map. */
+#define SIG_POOL_BASE SIG_COUNT
+#define SIG_POOL_MAX 8
+
 static const char *SIG_NAMES[SIG_COUNT] = {
     "dnDrive", "motorDrive", "dnSteer",
     "flowYaw", "flowRoll", "flowPitch", "touch",
 };
 
-static int signal_index(const char *name) {
+static int signal_index(const char *name, int n_pools) {
+    if (n_pools > 0 && strncmp(name, "pool", 4) == 0) {
+        int idx = atoi(name + 4);
+        if (idx >= 0 && idx < n_pools && idx < SIG_POOL_MAX)
+            return SIG_POOL_BASE + idx;
+    }
     for (int i = 0; i < SIG_COUNT; i++)
         if (strcmp(SIG_NAMES[i], name) == 0) return i;
     return -1;
 }
 
+/* "pool2" -> idx 2 (differentials "pool1-pool2" are handled separately) */
+static int pool_ref(const char *s, int n_pools) {
+    if (n_pools <= 0 || strncmp(s, "pool", 4) != 0) return -1;
+    int idx = atoi(s + 4);
+    if (idx < 0 || idx >= n_pools || idx >= SIG_POOL_MAX) return -1;
+    return idx;
+}
+
 static void readout_compute(FbRuntime *rt, float *out /* n_channels */) {
     const FbConfig *cfg = &rt->cfg;
     FbCircuit *net = rt->net;
+    float yaw_cmd = 0.0f;
     for (int i = 0; i < rt->n_channels; i++) out[i] = 0.0f;
 
-    /* ---- decode the circuit's own state ---- */
-    float sig[SIG_COUNT] = {0};
+    /* ---- decode the circuit's own state ----
+     * sig[] holds population readouts (SIG_*) plus, when the embodiment
+     * declares readout.pools, the DIRECT neuron-level pool integrals
+     * (SIG_POOL0+). Both kinds are circuit state; which one feeds which
+     * actuator is the declared map below. */
+    float sig[SIG_COUNT + SIG_POOL_MAX] = {0};
     float dn = fb_rate_of(net, "descending");
     float motor = fb_rate_of(net, "motor");
     sig[SIG_DN_DRIVE] = clampf(dn / cfg->dn_hz_scale, 0.0f, 1.0f);
@@ -167,21 +194,38 @@ static void readout_compute(FbRuntime *rt, float *out /* n_channels */) {
     sig[SIG_FLOW_PITCH] = 0.5f * (f.vL + f.vR);
     sig[SIG_TOUCH] = cfg->touch_gain > 0.0f
         ? clampf(net->touch_blast_mV / cfg->touch_gain, 0.0f, 1.0f) : 0.0f;
+    if (net->n_pools > 0)
+        fb_pools_snapshot(net, sig + SIG_POOL_BASE, SIG_POOL_MAX);
 
-    /* ---- the declared decode map: population -> channel ----
-     * Entries name a SIGNAL (a population readout above) and a CHANNEL
-     * (an actuator from the profile); channel = offset + gain*signal.
-     * Unknown names are skipped, never invented. */
-    float yaw_cmd = 0.0f;
+    /* ---- the declared decode map: signal -> channel ----
+     * Entries name a SIGNAL (a population readout, or a direct motor pool
+     * "pool0".."pool7") and a CHANNEL (an actuator from the profile);
+     * channel = offset + gain*signal, or offset + gain*tanh(signal) when
+     * the entry declares "shape":"tanh" (output amplification-with-
+     * saturation for wide-range channels). Unknown names are skipped,
+     * never invented. */
     for (int m = 0; m < cfg->n_map; m++) {
         const FbMapEntry *e = &cfg->map[m];
-        int s = signal_index(e->signal);
-        if (s < 0) continue;
+        float sv;
+        const char *dash = strchr(e->signal, '-');
+        if (dash) {
+            /* pool differential "poolA-poolB": signed asymmetry between two
+             * pools (e.g. left-half vs right-half motor neurons = steer) */
+            int a = pool_ref(e->signal, net->n_pools);
+            int b = pool_ref(dash + 1, net->n_pools);
+            if (a < 0 || b < 0) continue;
+            sv = sig[SIG_POOL_BASE + a] - sig[SIG_POOL_BASE + b];
+        } else {
+            int s = signal_index(e->signal, net->n_pools);
+            if (s < 0) continue;
+            sv = sig[s];
+        }
         int ch = -1;
         for (int i = 0; i < rt->n_channels; i++)
             if (strcmp(rt->ch[i].name, e->channel) == 0) { ch = i; break; }
         if (ch < 0) continue;
-        out[ch] += e->offset + e->gain * sig[s];
+        float v = e->shape ? tanhf(sv) : sv;
+        out[ch] += e->offset + e->gain * v;
     }
     /* clamp here too; actuators_apply applies the channel slew after */
     for (int i = 0; i < rt->n_channels; i++) {
@@ -257,6 +301,28 @@ static void memory_save(FbRuntime *rt, int force) {
     fb_str_append_f(&s, rt->net->sim_ms / 1000.0, 2);
     fb_str_append(&s, ",\"rewardSum\":");
     fb_str_append_f(&s, rt->net->cum_reward, 3);
+    /* learned motor-pool weights (readout.pools) ride in the same file */
+    {
+        char (*pnm)[32] = (char (*)[32])malloc(4096 * sizeof(*pnm));
+        if (pnm) {
+            double *pw = NULL; int pnw = 0;
+            int pc = fb_pools_export(rt->net, pnm, 4096, &pw, &pnw);
+            if (pc > 0 && pw) {
+                fb_str_append(&s, ",\"pools\":[");
+                for (int i = 0; i < pc; i++) {
+                    if (i) fb_str_push(&s, ',');
+                    fb_str_append(&s, "{\"n\":");
+                    fb_str_append_json_str(&s, pnm[i]);
+                    fb_str_append(&s, ",\"w\":");
+                    fb_str_append_f(&s, pw[i], 5);
+                    fb_str_push(&s, '}');
+                }
+                fb_str_push(&s, ']');
+            }
+            free(pw);
+            free(pnm);
+        }
+    }
     fb_str_append(&s, ",\"circuit\":{\"neurons\":");
     fb_str_append_int(&s, rt->net->c->N);
     fb_str_append(&s, ",\"plasticEdges\":");
@@ -270,6 +336,50 @@ static void memory_save(FbRuntime *rt, int force) {
     }
     fb_str_free(&s);
     free(idx); free(w);
+}
+
+/* learned motor-pool weights ride in the same memory file (keys are
+ * neuron-id:group); a no-op until pools exist (readout.pools configured) */
+static void pools_import_json(FbRuntime *rt, const FbJson *pl) {
+    if (!pl || pl->type != FB_JSON_ARR || pl->n <= 0) return;
+    if (rt->net->n_pools <= 0) return;
+    char (*pnm)[32] = (char (*)[32])malloc((size_t)pl->n * sizeof(*pnm));
+    double *pw = (double *)malloc((size_t)pl->n * sizeof(double));
+    if (!pnm || !pw) { free(pnm); free(pw); return; }
+    int k = 0;
+    for (int i = 0; i < pl->n; i++) {
+        const FbJson *o = pl->items[i];
+        const char *nm = fb_json_str(o, "n", "");
+        if (!nm[0]) continue;
+        snprintf(pnm[k], 32, "%s", nm);
+        pw[k] = fb_json_num(o, "w", 1.0);
+        k++;
+    }
+    if (k > 0 && fb_pools_import(rt->net, pnm, pw, k) > 0)
+        rt->pools_restored = 1;
+    free(pnm); free(pw);
+}
+
+/* Re-import pool weights from the memory file: needed when pools are
+ * configured after the boot-time restore (profile negotiated by a client,
+ * or pool config applied once restore has already run). Synapse memory is
+ * untouched — this only fills the (then-existing) pools. */
+static void pools_restore_from_disk(FbRuntime *rt) {
+    if (rt->pools_restored || rt->net->n_pools <= 0) return;
+    size_t len;
+    uint8_t *text = fb_read_file(rt->cfg.memory_path, &len);
+    if (!text) return;
+    FbJson *m = fb_json_parse((char *)text);
+    free(text);
+    if (!m) return;
+    const FbJson *cir = fb_json_get(m, "circuit");
+    if (cir && ((int)fb_json_num(cir, "neurons", -1) != rt->net->c->N ||
+                (int)fb_json_num(cir, "plasticEdges", -1) != rt->net->plastic_n)) {
+        fb_json_free(m);
+        return;
+    }
+    pools_import_json(rt, fb_json_get(m, "pools"));
+    fb_json_free(m);
 }
 
 static int memory_restore(FbRuntime *rt) {
@@ -301,6 +411,8 @@ static int memory_restore(FbRuntime *rt) {
         n = fb_load_memory(rt->net, idx, w, n);
         free(idx); free(w);
     }
+    /* learned motor-pool weights (same file; keys are neuron-id:group) */
+    pools_import_json(rt, fb_json_get(m, "pools"));
     fb_json_free(m);
     return n;
 }
@@ -349,6 +461,28 @@ FbRuntime *fb_runtime_new(const FbConfig *cfg) {
     sensors_init(&rt->sens);
     rt->frames = 0;
     rt->restored = memory_restore(rt);
+    /* motor pools (readout.pools): direct neuron->actuator channels.
+     * Configured AFTER memory_restore so the restore's own pool import
+     * (when the memory file already carries pool weights) wins; a fresh
+     * file gets its weights back-filled from disk here. */
+    if (cfg->n_pools > 0) {
+        FbPoolCfg pcfg[8];
+        int npcfg = 0;
+        for (int i = 0; i < cfg->n_pools && npcfg < 8; i++) {
+            snprintf(pcfg[npcfg].group, sizeof(pcfg[npcfg].group), "%s",
+                     cfg->pools[i].group);
+            pcfg[npcfg].every = cfg->pools[i].every;
+            pcfg[npcfg].split_lr = cfg->pools[i].split_lr;
+            pcfg[npcfg].which = cfg->pools[i].which;
+            npcfg++;
+        }
+        int built = fb_pools_configure(rt->net, pcfg, npcfg,
+                                       cfg->pool_integrate_ms, cfg->pool_learn);
+        if (built != cfg->n_pools)
+            fprintf(stderr, "config: pools built %d of %d declared\n",
+                    built, cfg->n_pools);
+        pools_restore_from_disk(rt);
+    }
     return rt;
 }
 
@@ -475,9 +609,22 @@ static void *loop_main(void *arg)
         double cost = rt->tick_cost_ema > 2.0 ? rt->tick_cost_ema : 2.0;
         int ticks = (int)(want_bio / cost);
         if (ticks < 1) ticks = 1;
+        /* Run the frame's tick budget in CHUNKS with the runtime lock
+         * released between chunks: holding the lock across the whole frame
+         * starves API threads (REST /telemetry, WS control) for the entire
+         * frame — tens of ms at full connectome. Chunk boundaries are safe
+         * for the circuit (only this thread runs fb_tick), and the chunk
+         * loop only touches the thread-private rgb pointers + counters. */
+        int chunk = ticks / 4 + (ticks % 4 ? 1 : 0);
         double t1 = fb_now();
-        for (int k = 0; k < ticks; k++)
-            fb_tick(net, rgb[0], rgb[1], W, H);
+        for (int done = 0; done < ticks; done += chunk) {
+            int kmax = ticks - done < chunk ? ticks - done : chunk;
+            for (int k = 0; k < kmax; k++)
+                fb_tick(net, rgb[0], rgb[1], W, H);
+            rt_unlock(rt);            /* let REST / control threads through */
+            fb_sleep_ms(1);           /* real yield: Sleep(0) doesn't cede the core */
+            rt_lock(rt);
+        }
         double used = (fb_now() - t1) * 1000.0;
         fb_learn_step(net);
         rt->frames++;
@@ -615,6 +762,22 @@ void fb_runtime_apply_reward(FbRuntime *rt, float r) {
     rt_unlock(rt);
 }
 
+/* Switch the EMBODIMENT (actuator channels + readout map + sensors) while
+ * running. The circuit itself is untouched: same neurons, same synapses,
+ * same learned memory — only the body the readout drives changes.
+ * cfg: the main()'s master config (kept in sync); profile_path resolves
+ * exactly like main()'s --profile flag. */
+void fb_runtime_switch_profile(FbRuntime *rt, FbConfig *cfg,
+                               const char *profile_path) {
+    fb_config_apply_profile_to_runtime(cfg, rt, profile_path);
+}
+
+/* public hook for config.c: back-fill pool weights from the memory file
+ * when pools are configured after the boot-time restore */
+void fb_runtime_pools_restore_from_disk(FbRuntime *rt) {
+    pools_restore_from_disk(rt);
+}
+
 int fb_runtime_actions_copy(FbRuntime *rt, FbChannel *out, int cap) {
     rt_lock(rt);
     int n = rt->n_channels < cap ? rt->n_channels : cap;
@@ -665,6 +828,16 @@ char *fb_runtime_telemetry_json(FbRuntime *rt) {
     fb_str_append_f(&s, net->dopa_self, 3);
     fb_str_append(&s, ",\"danBase\":");
     fb_str_append_f(&s, net->dan_base_hz, 2);
+    fb_str_append(&s, ",\"poolsRaw\":[");
+    if (net->n_pools > 0) {
+        float pv[8];
+        fb_pools_snapshot(net, pv, 8);
+        for (int p = 0; p < net->n_pools && p < 8; p++) {
+            if (p) fb_str_push(&s, ',');
+            fb_str_append_f(&s, pv[p], 4);
+        }
+    }
+    fb_str_push(&s, ']');
     fb_str_append(&s, ",\"dnSteer\":");
     fb_str_append_f(&s, net->last_dn_l - net->last_dn_r, 4);
     fb_str_append(&s, ",\"turn\":");
@@ -771,6 +944,28 @@ char *fb_runtime_memory_json(FbRuntime *rt) {
     fb_str_append_f(&s, sim, 2);
     fb_str_append(&s, ",\"rewardSum\":");
     fb_str_append_f(&s, rw, 3);
+    /* learned motor-pool weights (readout.pools) ride in the same file */
+    {
+        char (*pnm)[32] = (char (*)[32])malloc(4096 * sizeof(*pnm));
+        if (pnm) {
+            double *pw = NULL; int pnw = 0;
+            int pc = fb_pools_export(rt->net, pnm, 4096, &pw, &pnw);
+            if (pc > 0 && pw) {
+                fb_str_append(&s, ",\"pools\":[");
+                for (int i = 0; i < pc; i++) {
+                    if (i) fb_str_push(&s, ',');
+                    fb_str_append(&s, "{\"n\":");
+                    fb_str_append_json_str(&s, pnm[i]);
+                    fb_str_append(&s, ",\"w\":");
+                    fb_str_append_f(&s, pw[i], 5);
+                    fb_str_push(&s, '}');
+                }
+                fb_str_push(&s, ']');
+            }
+            free(pw);
+            free(pnm);
+        }
+    }
     fb_str_append(&s, ",\"circuit\":{\"neurons\":");
     fb_str_append_int(&s, nn);
     fb_str_append(&s, ",\"plasticEdges\":");

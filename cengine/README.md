@@ -11,7 +11,7 @@ neuroscience happens here.
 |---|---|
 | `flybrain.c` | FLYBRAIN1 connectome loader (4-byte-aligned sections, LE) |
 | `circuit.c`  | LIF engine: per-group biophysics, per-target in-degree normalization, CSR delivery, axonal delays, Tsodyks-Markram depression, retinotopic photoreceptors, **frame-locked Hassenstein–Reichardt T4/T5 EMDs** on real preferred-direction subtypes, DAN neuromodulation, dopamine-gated R-STDP + Turrigiano scaling |
-| `runtime.c`  | tick loop (adaptive bio-budget), lock-free frame coalescing, neural readout (declared decode map only — no scripted behavior), memory persistence |
+| `runtime.c`  | tick loop (adaptive bio-budget, chunked so API threads never starve behind a full-connectome frame), lock-free frame coalescing, neural readout (declared decode map only — no scripted behavior), live embodiment-profile switching, memory persistence |
 | `api.c`      | WebSocket `/stream` (binary eye frames in, action frames out at 60 Hz) + REST `/telemetry /actions /memory /health` |
 | `config.c`   | JSON config + embodiment profiles (`config/flybrain.json`, `config/profiles/*.json`) |
 | `engine_test.c` | in-process self-test: directional selectivity + symmetry on the real connectome |
@@ -25,6 +25,10 @@ Client → server (WS `/stream`):
   single-eye embodiments just send eye 0)
 - `0x02` state: `u8 type, u8 flags(bit0=collision), f32 altitude, speed, vy, clearance`
 - JSON: `{"type":"hello"|"telemetry"|"control"|"reward", ...}`
+  - `hello`: optional `{"profile":"rover"}` (or a path to a profile JSON)
+    switches the EMBODIMENT live — actuator channels, readout map, sensors —
+    so one running brain can serve a drone and a rover at different times.
+    The circuit and its learned memory are untouched.
   - `control`: `{"learning":bool}`, `{"wipe":true}` (reset memory to defaults),
     or `{"memory":{...}}` (import learned weights)
   - `reward`: `{"value":float}` — external reward bias (see "Self-regulated dopamine")
@@ -106,12 +110,56 @@ invented. A new body = a new JSON profile: name its channels, declare the map.
 | `flowRoll` | T4/T5 whole-field horizontal flow (optic-lobe consensus) |
 | `flowPitch` | T4/T5 vertical flow (optic-lobe consensus) |
 | `touch` | mechanosensory burst envelope (0..1) |
+| `pool0`..`pool7` | **direct motor pools** (below) |
+| `poolA-poolB` | signed differential between two pools (steering) |
+
+### Direct motor pools (`readout.pools`)
+
+The population signals above decode whole-group averages. A body may instead
+wire **individual motor neurons** to its actuators — pool `i` is a selected
+subset of one connectome group whose spikes integrate into a leaky
+accumulator (motor-unit temporal summation, `readout.integrateMs`, default
+90 ms). The pool integrals enter the same map as `pool0`.. signals:
+
+```json
+"readout": {
+  "integrateMs": 90, "learn": true,
+  "pools": [
+    { "group": "motor", "every": 7 },
+    { "group": "motor", "split": "lr", "which": 0 },
+    { "group": "motor", "split": "lr", "which": 1 }
+  ],
+  "map": [
+    { "channel": "throttle", "signal": "pool0", "gain": 5.0, "offset": -1.6 },
+    { "channel": "steer", "signal": "pool1-pool2", "gain": 40.0, "shape": "tanh" }
+  ]
+}
+```
+
+`every:k` picks one neuron of every k (ascending id); `split:"lr"`
+partitions by connectome side (falling back to an id-order half split where
+side is degenerate, as in the VNC). Pool values are mean-per-neuron spike
+integrals, so pools of different sizes are comparable. With `"learn":true`
+each member's weight is PLASTIC — moved per tick by the same self-regulated
+dopamine error that gates R-STDP (`w += lr·dopa·(spike − tonic)`), with the
+same soft bounds and the same rule that a constant situation teaches
+nothing. The learned body map persists in the memory file (`"pools":[…]`)
+alongside the synapse multipliers, survives restarts, and is carried across
+live profile switches. `config/profiles/rover-pools.json` and
+`drone-pools.json` ship as working examples.
 
 Per embodiment (`config/profiles/`): the **drone** declares
-throttle/pitch/roll/yaw; the **rover** declares throttle/steer. Gains in the
-map shape how strongly a population drives a channel — they are anatomy
+throttle/pitch/roll/yaw; the **rover** declares throttle/steer; the
+`-pools` variants drive their channels through direct motor pools. Gains in
+the map shape how strongly a signal drives a channel — they are anatomy
 annotations, not behavioral controllers: all behavior originates in the
-circuit (EMD flow, DN steering, R-STDP memory) and its own dopamine.
+circuit (EMD flow, DN steering, R-STDP memory, pool plasticity) and its own
+dopamine.
+
+Browser embodiments live in `examples/`: `drone-web/` drives the drone
+profile, `rover-web/` drives the rover profile (single forward eye, so the
+retina's two hemispheres each view half of the same image — run the server
+with `--profile rover`).
 
 ## Verified
 

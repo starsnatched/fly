@@ -231,3 +231,5 @@ state/
 node_modules/
 examples/drone-web/node_modules/
 examples/drone-web/dist/
+examples/rover-web/node_modules/
+examples/rover-web/dist/

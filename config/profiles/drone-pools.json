@@ -1,0 +1,44 @@
+{
+  "readout": {
+    "dnHzScale": 8.0,
+    "integrateMs": 90,
+    "learn": true,
+    "pools": [
+      { "group": "motor", "every": 7 },
+      { "group": "motor", "split": "lr", "which": 0 },
+      { "group": "motor", "split": "lr", "which": 1 }
+    ],
+    "map": [
+      { "channel": "throttle", "signal": "pool0", "gain": 5.0, "offset": -1.6 },
+      { "channel": "pitch", "signal": "dnDrive", "gain": 0.55, "offset": -0.69 },
+      { "channel": "pitch", "signal": "flowRoll", "gain": 1.2, "shape": "tanh" },
+      { "channel": "roll", "signal": "flowRoll", "gain": 1.2, "shape": "tanh" },
+      { "channel": "yaw", "signal": "pool1-pool2", "gain": 40.0, "shape": "tanh" }
+    ]
+  },
+  "actuators": {
+    "channels": [
+      { "name": "throttle", "lo": 0.0, "hi": 1.0, "slewPerS": 6.0, "default": 0.0 },
+      { "name": "pitch", "lo": -1.0, "hi": 1.0, "slewPerS": 8.0, "default": 0.0 },
+      { "name": "roll", "lo": -1.0, "hi": 1.0, "slewPerS": 8.0, "default": 0.0 },
+      { "name": "yaw", "lo": -1.0, "hi": 1.0, "slewPerS": 8.0, "default": 0.0 }
+    ]
+  },
+  "sensors": {
+    "visionHz": 120,
+    "eyes": { "count": 2, "leftId": 0, "rightId": 1 },
+    "touch": { "burstMv": 6.0, "holdMs": 40 },
+    "scalarRanges": {
+      "altitude": [0.0, 30.0],
+      "speed": [0.0, 18.0],
+      "vy": [-8.0, 8.0],
+      "clearance": [0.0, 60.0],
+      "tauScale": 9.0
+    }
+  },
+  "reward": {
+    "rewardGain": 0.3,
+    "shape": "relative",
+    "shapeTauS": 12.0
+  }
+}

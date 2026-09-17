@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
         ws_port = cfg.ws_port;
         rest_port = cfg.rest_port;
     }
-    FbApi *api = fb_api_new(rt, ws_port, rest_port);
+    FbApi *api = fb_api_new(rt, &cfg, ws_port, rest_port);
     if (!api) {
         fb_runtime_free(rt);
         return 1;

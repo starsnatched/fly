@@ -134,6 +134,29 @@ static int cmp_i64(const void *a, const void *b) {
 
 typedef struct { int64_t tgt; int pos; } TgtPos;
 
+/* motor pools: DIRECT per-neuron actuator channels (readout.pools). A pool
+ * is a selected subset of one group's neurons; its spikes integrate into a
+ * leaky accumulator (motor-unit temporal summation) and that integral is
+ * the raw actuator signal. With "learn":true each pool neuron owns a
+ * plastic weight, driven by the SAME self-regulated dopamine error
+ * (dopa_self) that gates R-STDP: sustained dopa>0 (doing better than the
+ * adapting baseline) potentiates whichever neurons are actually firing,
+ * dopa<0 depresses them. The (spike - tonic) term means a constant
+ * situation teaches nothing — the same anti-wedging rule the synapses
+ * follow. Weights persist in the memory file alongside the synapse
+ * multipliers, keyed by neuron id + group name. */
+struct FbPool {
+    int64_t *ids;         /* member neuron ids (circuit indices) */
+    int n;
+    int64_t *widx;        /* parallel plastic weight idx (== ids when learn) */
+    double *w;            /* plastic multipliers (only when learn) */
+    int learn;
+    float set_hz;         /* group tonic rate: (spike - tonic) learning ref */
+    float acc;            /* leaky spike integral = raw actuator signal */
+    float decay;          /* per-tick multiplier from integrate_ms */
+};
+static void fb_pools_tick(FbCircuit *n, float dopa);
+
 static int cmp_tgtpos(const void *a, const void *b) {
     const TgtPos *x = (const TgtPos *)a, *y = (const TgtPos *)b;
     if (x->tgt != y->tgt) return x->tgt < y->tgt ? -1 : 1;
@@ -455,6 +478,12 @@ void fb_circuit_free(FbCircuit *n) {
     free(n->scale_pos); free(n->scale_bounds);
     free(n->plastic_sorted); free(n->plastic_order);
     free(n->dn_l_mask); free(n->dn_r_mask);
+    for (int i = 0; i < n->n_pools; i++) {
+        free(n->pools[i].ids);
+        free(n->pools[i].widx);
+        free(n->pools[i].w);
+    }
+    free(n->pools);
     free(n->i_ext); free(n->noise); free(n->vm_next); free(n->vth_eff);
     free(n->fire); free(n->fired);
     free(n->sensory_set);
@@ -863,6 +892,10 @@ int fb_tick(FbCircuit *n, const float *rgb_l, const float *rgb_r, int gw, int gh
         if (fabsf(n->reward) < 1e-3f) n->reward = 0.0f;
     }
 
+    /* motor pools: integrate member spikes + move plastic weights with
+     * THIS tick's dopamine error (the teaching signal R-STDP follows) */
+    if (n->n_pools > 0) fb_pools_tick(n, n->dopa_self);
+
     /* corruption tripwire */
     if (!isfinite(n->vm[0]) || !isfinite(n->reward)) {
         n->corrupted = 1;
@@ -1026,6 +1059,7 @@ void fb_reset_plasticity(FbCircuit *n) {
     for (int k = 0; k < n->plastic_n; k++) n->w_mult[k] = 1.0;
     memset(n->elig, 0, (size_t)n->plastic_n * sizeof(double));
     for (int e = 0; e < n->c->E; e++) n->wm_edge[e] = 1.0;
+    fb_pools_reset(n);   /* learned body map resets with the synapses */
     n->reward = 0; n->dan_drive = 0; n->cum_reward = 0;
     /* re-warm: re-baseline the DAN so the wipe itself teaches nothing */
     n->warming = 1;
@@ -1060,4 +1094,207 @@ int fb_load_memory(FbCircuit *n, const int *idx, const double *w, int count) {
         hits++;
     }
     return hits;
+}
+
+/* ------------------------------------------------- motor pools (see top) */
+
+int fb_pools_configure(FbCircuit *n, const FbPoolCfg *cfgs, int n_cfgs,
+                       int integrate_ms, int learn) {
+    for (int i = 0; i < n->n_pools; i++) {
+        free(n->pools[i].ids);
+        free(n->pools[i].widx);
+        free(n->pools[i].w);
+    }
+    free(n->pools);
+    n->pools = NULL;
+    n->n_pools = 0;
+    if (!cfgs || n_cfgs <= 0) return 0;
+    int tau_ms = integrate_ms > 0 ? integrate_ms : 80;
+    FbPool *p = (FbPool *)calloc((size_t)n_cfgs, sizeof(FbPool));
+    if (!p) return 0;
+    int built = 0;
+    for (int i = 0; i < n_cfgs; i++) {
+        const FbPoolCfg *pc = &cfgs[i];
+        int g = fb_group_index(n, pc->group);
+        if (g < 0) continue;
+        int total = 0;
+        for (int j = 0; j < n->c->N; j++) if (n->grp[j] == g) total++;
+        if (total <= 0) continue;
+        int64_t *ids = (int64_t *)malloc((size_t)total * sizeof(int64_t));
+        if (!ids) continue;
+        int m = 0;
+        if (pc->split_lr) {
+            /* partition by connectome side; motor (VNC) neurons are all
+             * side==1, so fall back to every-2 there (still a signed pair) */
+            int with_side = 0, ones = 0;
+            for (int j = 0; j < n->c->N; j++) {
+                if (n->grp[j] != g) continue;
+                with_side++;
+                if (n->c->side[j] == (uint8_t)pc->which) ones++;
+            }
+            int want = pc->which ? ones : with_side - ones;
+            if (want > 0 && want < with_side) {
+                for (int j = 0; j < n->c->N; j++)
+                    if (n->grp[j] == g && n->c->side[j] == (uint8_t)pc->which)
+                        ids[m++] = j;
+            } else {
+                /* side is degenerate on this group: id-order half split */
+                int want = (pc->which ? (total + 1) / 2 : total / 2);
+                int seen = 0;
+                for (int j = 0; j < n->c->N; j++) {
+                    if (n->grp[j] != g) continue;
+                    if (pc->which ? seen >= total - want : seen < want)
+                        ids[m++] = j;
+                    seen++;
+                }
+            }
+        } else if (pc->every > 1) {
+            for (int j = 0; j < n->c->N; j++) {
+                if (n->grp[j] == g && (j % pc->every) == 0) ids[m++] = j;
+            }
+        } else {
+            for (int j = 0; j < n->c->N; j++)
+                if (n->grp[j] == g) ids[m++] = j;
+        }
+        if (m <= 0) { free(ids); continue; }
+        p[built].ids = ids;
+        p[built].n = m;
+        p[built].learn = learn ? 1 : 0;
+        p[built].set_hz = n->bio_set_hz[ids[0]] > 0.5f
+            ? n->bio_set_hz[ids[0]] : 2.0f;
+        if (learn) {
+            p[built].widx = (int64_t *)malloc((size_t)m * sizeof(int64_t));
+            p[built].w = (double *)malloc((size_t)m * sizeof(double));
+            if (!p[built].widx || !p[built].w) {
+                free(p[built].widx); free(p[built].w);
+                free(ids);
+                p[built].ids = NULL;
+                continue;
+            }
+            for (int k = 0; k < m; k++) { p[built].widx[k] = ids[k]; p[built].w[k] = 1.0; }
+        }
+        p[built].decay = expf(-(float)FB_DT_MS / (float)tau_ms);
+        built++;
+    }
+    if (!built) { free(p); return 0; }
+    n->pools = p;
+    n->n_pools = built;
+    return built;
+}
+
+FbPool *fb_runtime_pools(FbCircuit *n) { return n->pools; }
+int fb_pools_count(const FbCircuit *n) { return n->n_pools; }
+
+/* per tick: fold this tick's pool-neuron spikes into the accumulators and
+ * learn. weight_t = weight_{t-1} + lr*dopa*(spike_t - tonic_rate*dt).
+ * The (spike - tonic) term is the anti-wedging rule: a neuron at its tonic
+ * rate contributes ~0 per tick regardless of dopa sign, so weights stop
+ * moving in constant situations; dopa<0 plus ABOVE-tonic firing depresses
+ * the pool. lr matches the synapse LTP rate per second. */
+static void fb_pools_tick(FbCircuit *n, float dopa) {
+    const float dt = (float)FB_DT_MS;
+    const float lr = 0.08f / 1000.0f * dt;   /* a_ltp per tick */
+    for (int i = 0; i < n->n_pools; i++) {
+        FbPool *pl = &n->pools[i];
+        pl->acc *= pl->decay;
+        if (pl->acc < 1e-5f) pl->acc = 0.0f;
+        if (dopa != 0.0f && pl->learn) {
+            const float base = pl->set_hz * dt / 1000.0f; /* tonic spikes/tick */
+            for (int k = 0; k < pl->n; k++) {
+                const int64_t j = pl->ids[k];
+                const float act = (float)(n->spike_counts[j] > 0) - base;
+                if (act == 0.0f) continue;
+                double w = pl->w[k];
+                double room = (dopa > 0.0f) ? (n->p.w_max - w) : (w - n->p.w_min);
+                double full = (double)n->p.w_max - (double)n->p.w_min;
+                double move = (double)lr * (double)dopa * (double)act;
+                if (move > 0) move *= room / full;
+                double wm = w + move;
+                if (wm < n->p.w_min) wm = n->p.w_min;
+                if (wm > n->p.w_max) wm = n->p.w_max;
+                pl->w[k] = wm;
+            }
+        }
+        for (int k = 0; k < pl->n; k++) {
+            const int64_t j = pl->ids[k];
+            if (n->spike_counts[j] > 0)
+                pl->acc += pl->w ? (float)pl->w[k] : 1.0f;
+        }
+    }
+}
+
+/* frame-end: hand the leaky integrals to the runtime readout.
+ * NORMALIZED by member count: a pool's value is the mean per-neuron spike
+ * integral over the window (rate x tau), so pools of different sizes are
+ * comparable and the embodiment gain means the same thing for any pick. */
+void fb_pools_snapshot(const FbCircuit *n, float *out, int cap) {
+    int m = n->n_pools < cap ? n->n_pools : cap;
+    for (int i = 0; i < m; i++)
+        out[i] = n->pools[i].n > 0 ? n->pools[i].acc / (float)n->pools[i].n : 0.0f;
+}
+
+int fb_pools_export(FbCircuit *n, char (*names)[32], int max_names,
+                    double **out_w, int *out_n) {
+    int cnt = 0;
+    for (int i = 0; i < n->n_pools; i++) {
+        FbPool *pl = &n->pools[i];
+        if (!pl->learn || !pl->w) continue;
+        for (int k = 0; k < pl->n; k++) {
+            if (pl->w[k] == 1.0) continue;
+            if (cnt < max_names) {
+                snprintf(names[cnt], 32, "%d:%s", (int)pl->widx[k],
+                         n->c->groups[n->grp[pl->widx[k]]]);
+            }
+            cnt++;
+        }
+    }
+    *out_n = cnt;
+    if (!cnt) { *out_w = NULL; return 0; }
+    if (cnt > max_names) cnt = max_names;
+    double *w = (double *)malloc((size_t)cnt * sizeof(double));
+    if (!w) { *out_n = 0; return 0; }
+    int j = 0;
+    for (int i = 0; i < n->n_pools && j < cnt; i++) {
+        FbPool *pl = &n->pools[i];
+        if (!pl->learn || !pl->w) continue;
+        for (int k = 0; k < pl->n && j < cnt; k++) {
+            if (pl->w[k] == 1.0) continue;
+            w[j++] = pl->w[k];
+        }
+    }
+    *out_w = w;
+    return cnt;
+}
+
+int fb_pools_import(FbCircuit *n, char (*names)[32], const double *w, int count) {
+    int hits = 0;
+    for (int i = 0; i < n->n_pools; i++) {
+        FbPool *pl = &n->pools[i];
+        if (!pl->learn || !pl->w) continue;
+        for (int k = 0; k < pl->n; k++) {
+            char key[36];
+            snprintf(key, sizeof(key), "%d:%s", (int)pl->widx[k],
+                     n->c->groups[n->grp[pl->widx[k]]]);
+            for (int m = 0; m < count; m++) {
+                if (strncmp(names[m], key, 32) == 0) {
+                    double wc = w[m];
+                    if (wc < n->p.w_min) wc = n->p.w_min;
+                    if (wc > n->p.w_max) wc = n->p.w_max;
+                    pl->w[k] = wc;
+                    hits++;
+                    break;
+                }
+            }
+        }
+    }
+    return hits;
+}
+
+void fb_pools_reset(FbCircuit *n) {
+    for (int i = 0; i < n->n_pools; i++) {
+        FbPool *pl = &n->pools[i];
+        if (pl->w)
+            for (int k = 0; k < pl->n; k++) pl->w[k] = 1.0;
+        pl->acc = 0.0f;
+    }
 }

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FlyBrain Rover — MaleCNS connectome rover</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: #171009; }
+      #app { width: 100%; height: 100%; }
+      canvas { display: block; }
+      #hud {
+        position: fixed; inset: 0; pointer-events: none;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color: #f0e0b8;
+        text-shadow: 0 0 6px rgba(255, 200, 100, 0.3);
+      }
+      .panel {
+        position: absolute; padding: 10px 12px;
+        background: rgba(20, 12, 4, 0.55);
+        border: 1px solid rgba(255, 200, 110, 0.2);
+        border-radius: 8px; font-size: 11px; line-height: 1.55;
+        backdrop-filter: blur(3px);
+      }
+      #top-left { top: 14px; left: 14px; min-width: 210px; }
+      #top-right { top: 14px; right: 14px; text-align: left; }
+      #eye-view { bottom: 14px; left: 14px; }
+      #eye-view canvas {
+        width: 288px; height: 162px; border-radius: 4px;
+        border: 1px solid rgba(255, 200, 110, 0.3);
+        image-rendering: pixelated;
+      }
+      .eye-label { position: absolute; top: -20px; font-size: 10px; opacity: 0.75; }
+      #brain-traces { bottom: 14px; right: 14px; width: 300px; }
+      #brain-traces canvas { width: 100%; display: block; }
+      #traces { height: 84px; }
+      .hud-title { font-size: 10px; letter-spacing: 0.14em; opacity: 0.6; margin-bottom: 5px; text-transform: uppercase; }
+      .bar-row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+      .bar-label { width: 48px; opacity: 0.8; }
+      .bar-track { flex: 1; height: 5px; background: rgba(255, 200, 110, 0.12); border-radius: 3px; overflow: hidden; }
+      .bar-fill { height: 100%; background: linear-gradient(90deg, #ffb347, #ffe08a); border-radius: 3px; transition: width 80ms linear; }
+      .bar-val { width: 44px; text-align: right; opacity: 0.85; }
+      #mode-badge { color: #ffd166; }
+      #startup {
+        position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+        background: rgba(10, 6, 2, 0.92); z-index: 10; pointer-events: auto;
+        font-family: ui-monospace, Menlo, Consolas, monospace; color: #f0e0b8;
+        text-align: center; font-size: 13px; line-height: 1.8; cursor: pointer;
+      }
+      #startup .card { max-width: 640px; padding: 34px 40px; border: 1px solid rgba(255,200,110,0.3); border-radius: 12px; background: rgba(24, 14, 5, 0.85); }
+      #startup h1 { font-size: 18px; margin-bottom: 14px; color: #ffd166; letter-spacing: 0.06em; }
+      #startup .dim { opacity: 0.65; font-size: 11px; }
+      #startup .go { margin-top: 18px; color: #ffb347; font-size: 14px; animation: pulse 1.6s infinite; }
+      @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">
+      <div class="panel" id="top-left">
+        <div class="hud-title">FlyBrain Rover · MaleCNS</div>
+        <div class="bar-row"><span class="bar-label">speed</span><div class="bar-track"><div class="bar-fill" id="bar-spd"></div></div><span class="bar-val" id="val-spd">0m/s</span></div>
+        <div class="bar-row"><span class="bar-label">thr</span><div class="bar-track"><div class="bar-fill" id="bar-thr"></div></div><span class="bar-val" id="val-thr">0%</span></div>
+        <div class="bar-row"><span class="bar-label">steer</span><div class="bar-track"><div class="bar-fill" id="bar-str"></div></div><span class="bar-val" id="val-str">0.00</span></div>
+        <div class="bar-row"><span class="bar-label">clear</span><div class="bar-track"><div class="bar-fill" id="bar-clr"></div></div><span class="bar-val" id="val-clr">0m</span></div>
+        <div style="margin-top:6px">mode: <span id="mode-badge">CONNECTOME</span></div>
+        <div class="dim" style="opacity:0.55; margin-top:2px" id="circuit-info">circuit: loading…</div>
+      </div>
+      <div class="panel" id="top-right">
+        <div class="hud-title">Neural telemetry</div>
+        <div id="pop-stats">—</div>
+      </div>
+      <div class="panel" id="eye-view">
+        <div style="position:relative"><span class="eye-label">FORWARD EYE · RGB · what the brain receives (split L/R on the retina)</span><canvas id="eyeFwd" width="192" height="108"></canvas></div>
+      </div>
+      <div class="panel" id="brain-traces">
+        <div class="hud-title">Descending-neuron drive → drive commands</div>
+        <canvas id="traces" width="600" height="120"></canvas>
+      </div>
+    </div>
+    <div id="startup">
+      <div class="card">
+        <h1>🛞 FLYBRAIN ROVER</h1>
+        A skid-steer rover driven by a circuit of <b>real neurons</b> extracted from the MaleCNS
+        male fruit-fly connectome (Janelia/Google, Cell 2026 — CC-BY).<br/>
+        One forward camera → elementary motion detectors → 165,122 spiking neurons
+        (leaky integrate-and-fire) wired by 25.5M real connectome synapses → throttle + steer.<br/>
+        <span class="dim">Explore mode: open desert, no objectives, no restarts — bumps just bounce.
+        Add <b>?course=gaps</b> to the URL for the gap-crossing trial: pits punish a fall (−1, reset), a clean crossing rewards (+0.6).<br/>
+        Keys: WASD = nudge, C = manual override, R = respawn, L = learning, M = wipe memory, U/J = reward/punish</span>
+        <div class="go">▶ CLICK TO ROLL OUT</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

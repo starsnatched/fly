@@ -22,9 +22,10 @@ cengine/docker-compose.yml   one-command full stack (brain + example client)
 config/               engine config + embodiment profiles (drone, rover)
 data/                 fly-brain-full.bin — the ~300 MB connectome
                       (not in git; scripts/extract_full_brain.py rebuilds it)
-examples/drone-web/   one example embodiment: three.js drone client —
-                      the only TypeScript in the repo, talks only the API
-scripts/              connectome extractor + protocol test clients
+examples/drone-web/   example embodiments (three.js): drone + rover clients —
+examples/rover-web/   the only TypeScript in the repo, talks only the API
+scripts/              connectome extractor + protocol test clients +
+                      rover benchmark (rover_bench.py)
 state/                learned weights (created at runtime, not in git)
 ```
 
@@ -34,7 +35,7 @@ state/                learned weights (created at runtime, not in git)
 
 ```bash
 docker compose -f cengine/docker-compose.yml up --build
-# brain: ws://localhost:8787/stream + REST :8788 · client: http://localhost:5199
+# brain: ws://localhost:8787/stream + REST :8788 · clients: drone :5199, rover :5200
 ```
 
 **Without Docker** (only toolchain dependency: [zig](https://ziglang.org),
@@ -42,8 +43,21 @@ or `pip install ziglang`):
 
 ```bash
 cd cengine && make run                          # brain on :8787 (WS) + :8788 (REST)
-cd examples/drone-web && npm i && npm run dev   # example client on :5199
+cd examples/drone-web && npm i && npm run dev   # drone client on :5199
+cd examples/rover-web && npm i && npm run dev   # rover client on :5200
 ```
+
+The drone example pairs with the engine's `drone` profile, the rover with
+`rover`. No flag juggling needed: each browser client declares its body in
+the opening `hello` (`{"profile":"rover"}`) and the running brain switches
+its actuator/readout anatomy to match — one brain, several bodies.
+`--profile` still pins a profile at boot if you prefer.
+
+**Benchmarks:** `python scripts/rover_bench.py` runs a closed-loop
+obstacle-avoidance benchmark (learn → test with memory → test after wipe,
+reporting impacts / 100 m) against an isolated brain + memory.
+`examples/rover-web/?course=gaps` opens the gap-crossing trial: pits punish
+a fall (−1, soft reset), a clean crossing rewards (+0.6).
 
 **Talk to the brain yourself** — any WebSocket client works:
 
@@ -99,12 +113,19 @@ The brain has no idea what body it is flying — that is all config:
 - **`config/flybrain.json`** — engine, sensors, readout, reward, ports.
 - **`config/profiles/*.json`** — per-embodiment overlays. `drone.json`
   (throttle/pitch/roll/yaw) and `rover.json` (throttle/steer) ship as
-  examples. A hexapod, boat, or cursor is another JSON file: name your
+  examples, plus `drone-pools.json` / `rover-pools.json`, which drive their
+  channels through **direct motor pools** — individual connectome motor
+  neurons whose (plastic, dopamine-learned) spike integrals ARE the raw
+  channel signal. A hexapod, boat, or cursor is another JSON file: name your
   actuator channels, set their ranges/slew, declare the `readout.map`
-  (which neural population drives which channel, with what gain), set
-  `sensors.eyes.count` (2 = stereo pair, left eye mounted +35° / right −35°;
-  1 = one forward camera split across the retina's two hemispheres), and pick
-  which scalar state you send.
+  (which neural population or motor pool drives which channel, with what
+  gain), set `sensors.eyes.count` (2 = stereo pair, left eye mounted +35° /
+  right −35°; 1 = one forward camera split across the retina's two
+  hemispheres), and pick which scalar state you send.
+- The browser clients negotiate their body on connect
+  (`hello {"profile": ...}`); append `?profile=rover-pools` (or
+  `drone-pools`) to the page URL to run the motor-pool decode against the
+  same brain — no server restart needed.
 - The readout maps *neural state → named channels* generically — no scripted
   behavior, no reflex ladders: vision and touch enter the circuit as neural
   input, and everything the body does is what the connectome (plus R-STDP
@@ -136,6 +157,12 @@ The brain has no idea what body it is flying — that is all config:
   world, captures **two 192×108 RGB eye cameras** (±35°, streamed at 30 fps),
   sends proprioception, applies the returned channels to drone physics.
   Pure sensor/actuator — no neural code; swap it for your own client.
+- **`examples/rover-web/`** — a second embodiment for the `rover` profile
+  (three.js): a skid-steer desert rover with **one 192×108 forward camera**
+  (streamed at 120 Hz — the retina's left/right hemispheres each view half
+  the image, so turning reads as optic-flow asymmetry), wheel odometry and
+  bumper contacts, applying the returned `throttle`/`steer` channels.
+  Same deal: pure sensor/actuator, no neural code.
 - **`scripts/extract_full_brain.py`** — builds `data/fly-brain-full.bin`
   from the raw connectome, including 2-hop retinotopy inheritance so all
   13,585 T4/T5 columns are located.
@@ -148,7 +175,7 @@ cd cengine && make test                       # engine self-test (EMD steering)
 python scripts/e2e_client.py 8787               # protocol e2e vs the live server
 ```
 
-## Keys (demo client)
+## Keys (demo clients)
 
-`WASD` nudge · `C` manual override · `R` respawn · `L` toggle learning ·
-`M` wipe memory.
+Both examples: `WASD` nudge · `C` manual override · `R` respawn ·
+`L` toggle learning · `M` wipe memory · `U` reward +1 · `J` punish −1.

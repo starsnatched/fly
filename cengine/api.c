@@ -27,6 +27,7 @@ struct WsClient {
 
 struct FbApi {
     FbRuntime *rt;
+    FbConfig *cfg;              /* master config owned by main() */
     int ws_fd, rest_fd;
     WsClient *clients;
     int n_clients;
@@ -83,7 +84,13 @@ static void ws_send(FbApi *api, WsClient *c, int opcode, const uint8_t *payload,
     uint8_t *frame = (uint8_t *)malloc(cap);
     if (!frame) return;
     int len = ws_frame(frame, (int)cap, opcode, payload, plen);
-    if (len > 0) fb_send_all(c->fd, frame, (size_t)len);
+    if (len > 0) {
+        int r = fb_send_all(c->fd, frame, (size_t)len);
+        /* a PARTIAL write breaks WebSocket framing — the client can never
+         * resync its parser, so drop the connection (it reconnects clean).
+         * (-1 = nothing written: a benign would-block, just skip.) */
+        if (r >= 0 && r < len) c->want_close = 1;
+    }
     free(frame);
     (void)api;
 }
@@ -181,6 +188,22 @@ static void handle_json_msg(FbApi *api, WsClient *c, char *text, size_t len) {
     if (!obj) return;
     const char *type = fb_json_str(obj, "type", "");
     if (strcmp(type, "hello") == 0) {
+        /* profile negotiation: {"type":"hello","profile":"rover"} switches
+         * the EMBODIMENT (actuator channels + readout map + sensors) so one
+         * running brain can serve several bodies. The circuit, its learned
+         * memory, and other clients' sockets are untouched. */
+        const char *req_profile = fb_json_str(obj, "profile", "");
+        if (req_profile[0]) {
+            char profile_path[512] = "";
+            if (strchr(req_profile, '/') || strchr(req_profile, '\\') ||
+                (strlen(req_profile) > 5 &&
+                 strcmp(req_profile + strlen(req_profile) - 5, ".json") == 0))
+                snprintf(profile_path, sizeof(profile_path), "%s", req_profile);
+            else
+                snprintf(profile_path, sizeof(profile_path),
+                         "config/profiles/%s.json", req_profile);
+            fb_runtime_switch_profile(api->rt, api->cfg, profile_path);
+        }
         char *tel = fb_runtime_telemetry_json(api->rt);
         FbStr s;
         fb_str_init(&s);
@@ -482,9 +505,10 @@ int fb_api_serve(FbApi *api) {
                 int r = fb_recv(cb->fd, tmp, sizeof(tmp));
                 if (r == 0) {
                     /* closed */
+                    int dead_fd = cb->fd;
                     fb_close(cb->fd);
                     free(cb->buf);
-                    *cb = conns[n_conns - 1];
+                    if (cb != &conns[n_conns - 1]) *cb = conns[n_conns - 1];
                     n_conns--;
                     /* remove from client list too */
                     for (WsClient **pp = &api->clients; *pp; pp = &(*pp)->next) {
@@ -514,6 +538,33 @@ int fb_api_serve(FbApi *api) {
                         break;
                     }
                 }
+                /* reap flagged connections: answer the close handshake and
+                 * drop dead framing (without this, closes hang and partial
+                 * writes linger) */
+                {
+                    WsClient *c = api->clients;
+                    while (c && c->fd != cb->fd) c = c->next;
+                    if (c && c->want_close) {
+                        int dead_fd = cb->fd; /* capture BEFORE the slot swap */
+                        uint8_t cl[4] = { 0x88, 0x02, 0x03, 0xE8 }; /* close, code 1000 */
+                        fb_send_all(dead_fd, cl, 4); /* best effort */
+                        fb_close(dead_fd);
+                        free(cb->buf);
+                        if (cb != &conns[n_conns - 1]) *cb = conns[n_conns - 1];
+                        n_conns--;
+                        for (WsClient **pp = &api->clients; *pp; pp = &(*pp)->next) {
+                            if ((*pp)->fd == dead_fd) {
+                                WsClient *dead = *pp;
+                                *pp = dead->next;
+                                free(dead);
+                                api->n_clients--;
+                                fprintf(stderr, "api: client closed (%d total)\n", api->n_clients);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
             }
         }
 
@@ -525,7 +576,12 @@ int fb_api_serve(FbApi *api) {
                 for (WsClient *c = api->clients; c; c = c->next) {
                     uint8_t frame[512];
                     int fl = ws_frame(frame, sizeof(frame), OP_BIN, api->act, (size_t)len);
-                    if (fl > 0) fb_send_all(c->fd, frame, (size_t)fl);
+                    if (fl > 0) {
+                        int r = fb_send_all(c->fd, frame, (size_t)fl);
+                        /* partial frame = broken framing = drop the client;
+                         * nothing-written (would-block) = skip this tick */
+                        if (r >= 0 && r < fl) c->want_close = 1;
+                    }
                 }
             }
         }
@@ -533,9 +589,10 @@ int fb_api_serve(FbApi *api) {
     return 0;
 }
 
-FbApi *fb_api_new(FbRuntime *rt, int ws_port, int rest_port) {
+FbApi *fb_api_new(FbRuntime *rt, FbConfig *cfg, int ws_port, int rest_port) {
     FbApi *api = (FbApi *)calloc(1, sizeof(FbApi));
     api->rt = rt;
+    api->cfg = cfg;
     api->ws_fd = fb_tcp_listen(ws_port);
     api->rest_fd = fb_tcp_listen(rest_port);
     if (api->ws_fd < 0 || api->rest_fd < 0) {

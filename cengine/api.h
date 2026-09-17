@@ -6,7 +6,7 @@
 
 typedef struct FbApi FbApi;
 
-FbApi *fb_api_new(FbRuntime *rt, int ws_port, int rest_port);
+FbApi *fb_api_new(FbRuntime *rt, FbConfig *cfg, int ws_port, int rest_port);
 void fb_api_free(FbApi *api);
 
 /* run forever (blocks); returns only on fatal error */

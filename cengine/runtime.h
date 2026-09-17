@@ -36,7 +36,7 @@ typedef struct {
     float value;
 } FbChannel;
 
-typedef struct {
+typedef struct FbRuntime {
     FbConfig cfg;
     FbConnectome *con;
     FbCircuit *net;
@@ -55,6 +55,7 @@ typedef struct {
     double mem_timer;
     int64_t frames;
     int restored;
+    int pools_restored;   /* pool weights imported from the memory file */
 
     /* seed noise only; ALL behavior comes from the circuit's own state
      * (the circuit's per-neuron RNG is seeded from this) */
@@ -87,6 +88,17 @@ void fb_runtime_set_learning(FbRuntime *rt, int on);
 void fb_runtime_wipe_memory(FbRuntime *rt);
 int fb_runtime_import_memory(FbRuntime *rt, const FbJson *mem);
 void fb_runtime_apply_reward(FbRuntime *rt, float r); /* DAN excitability pathway */
+
+/* Switch the embodiment profile at runtime: actuator channels, readout map
+ * and sensors change; the circuit and its learned memory do not. cfg is the
+ * master config owned by main() (kept in sync with the runtime). */
+void fb_runtime_switch_profile(FbRuntime *rt, FbConfig *cfg,
+                               const char *profile_path);
+
+/* Back-fill pool weights from the memory file (CALLER HOLDS the runtime
+ * lock; does not lock internally). Used when pools are configured after
+ * the boot-time restore. */
+void fb_runtime_pools_restore_from_disk(FbRuntime *rt);
 
 /* snapshots for the API layer (thread-safe; caller frees) */
 char *fb_runtime_telemetry_json(FbRuntime *rt);       /* malloc'd */

@@ -1,4 +1,5 @@
 #include "config.h"
+#include "runtime.h"
 #include "util.h"
 
 #include <stdio.h>
@@ -10,6 +11,8 @@ static int parse_map_entry(FbMapEntry *e, const FbJson *m) {
     snprintf(e->signal, sizeof(e->signal), "%s", fb_json_str(m, "signal", ""));
     e->gain = (float)fb_json_num(m, "gain", 0.0);
     e->offset = (float)fb_json_num(m, "offset", 0.0);
+    const char *shape = fb_json_str(m, "shape", "");
+    e->shape = strcmp(shape, "tanh") == 0 ? 1 : 0;
     return e->channel[0] && e->signal[0];
 }
 
@@ -84,6 +87,29 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
             /* overlay: a profile with a map REPLACES the base map */
             cfg->n_map = kept;
         }
+        /* direct motor pools (readout.pools): same overlay semantics — a
+         * profile declaring pools REPLACES the base set. Pool i drives the
+         * actuator channel named "pool<i>" (declare it in actuators). */
+        const FbJson *pools = fb_json_get(ro, "pools");
+        if (pools && pools->type == FB_JSON_ARR) {
+            int n = pools->n > 8 ? 8 : pools->n;
+            int kept = 0;
+            for (int i = 0; i < n; i++) {
+                const FbJson *p = pools->items[i];
+                FbPoolEntry *pe = &cfg->pools[kept];
+                snprintf(pe->group, sizeof(pe->group), "%s", fb_json_str(p, "group", ""));
+                pe->every = (int)fb_json_num(p, "every", 0.0);
+                const char *split = fb_json_str(p, "split", "");
+                pe->split_lr = strcmp(split, "lr") == 0 ? 1 : 0;
+                pe->which = (int)fb_json_num(p, "which", 0.0);
+                if (pe->group[0]) kept++;
+            }
+            cfg->n_pools = kept;
+        }
+        cfg->pool_integrate_ms =
+            (int)fb_json_num(ro, "integrateMs", (double)cfg->pool_integrate_ms);
+        cfg->pool_learn =
+            fb_json_bool(ro, "learn", cfg->pool_learn ? true : false) ? 1 : 0;
     }
 
     const FbJson *act = fb_json_get(root, "actuators");
@@ -138,6 +164,9 @@ int fb_config_load(FbConfig *cfg, const char *path, const char *profile_path) {
     cfg->touch_gain = 6.0f;
     cfg->dn_hz_scale = 8.0f;
     cfg->n_map = 0;
+    cfg->n_pools = 0;
+    cfg->pool_integrate_ms = 80;
+    cfg->pool_learn = 1;
     cfg->n_channels = 4;
     snprintf(cfg->channels[0], 32, "throttle");
     snprintf(cfg->channels[1], 32, "pitch");
@@ -168,9 +197,32 @@ int fb_config_load(FbConfig *cfg, const char *path, const char *profile_path) {
     if (profile_path && profile_path[0]) {
         uint8_t *ptext = fb_read_file(profile_path, &len);
         if (ptext) {
+            /* process-scoped + engine settings must survive the overlay:
+             * copy_json_or_default hardcodes defaults, so a profile that
+             * omits them would otherwise RESET them (this is how a bench
+             * config with its own memoryPath got silently pointed back at
+             * the default memory file — and its wipe with it) */
+            FbConfig keep = *cfg;
             FbJson *root = fb_json_parse((char *)ptext);
             if (root) {
                 copy_json_or_default(cfg, root);
+                snprintf(cfg->memory_path, sizeof(cfg->memory_path), "%s", keep.memory_path);
+                cfg->sim_speed = keep.sim_speed;
+                cfg->max_bio_ms = keep.max_bio_ms;
+                cfg->autosave_s = keep.autosave_s;
+                cfg->g_scale = keep.g_scale;
+                cfg->tgt_budget = keep.tgt_budget;
+                cfg->ph_tonic = keep.ph_tonic;
+                cfg->ph_optic_gain = keep.ph_optic_gain;
+                cfg->emd_gain = keep.emd_gain;
+                cfg->dan_mod_gain = keep.dan_mod_gain;
+                cfg->dopa_gain = keep.dopa_gain;
+                cfg->dan_base_tau_s = keep.dan_base_tau_s;
+                cfg->dan_tonic_mv = keep.dan_tonic_mv;
+                cfg->learning = keep.learning;
+                cfg->tick_cost_seed_ms = keep.tick_cost_seed_ms;
+                cfg->ws_port = keep.ws_port;
+                cfg->rest_port = keep.rest_port;
                 fb_json_free(root);
             } else {
                 fprintf(stderr, "config: parse error in profile %s\n", profile_path);
@@ -181,4 +233,99 @@ int fb_config_load(FbConfig *cfg, const char *path, const char *profile_path) {
         }
     }
     return 0;
+}
+
+void fb_config_apply_profile_to_runtime(FbConfig *cfg, FbRuntime *rt,
+                                        const char *profile_path) {
+    if (!profile_path || !profile_path[0]) return;
+    size_t len = 0;
+    uint8_t *ptext = fb_read_file(profile_path, &len);
+    if (!ptext) {
+        fprintf(stderr, "config: profile %s not found (keeping current)\n",
+                profile_path);
+        return;
+    }
+    FbJson *root = fb_json_parse((char *)ptext);
+    free(ptext);
+    if (!root) {
+        fprintf(stderr, "config: parse error in profile %s\n", profile_path);
+        return;
+    }
+
+    /* Snapshot the runtime-scoped + engine sections, overlay the profile,
+     * then restore the snapshot: profiles may only change EMBODIMENT
+     * anatomy (sensors, readout map, actuator channels, reward pathway).
+     * Engine/neural knobs would desync the already-built circuit; memory
+     * path and ports belong to the process, not the body. */
+    const FbConfig pre = *cfg;
+    /* copy_json_or_default REPLACES the readout map when the profile
+     * declares one (documented profile-overlay semantics) */
+    copy_json_or_default(cfg, root);
+    fb_json_free(root);
+
+    snprintf(cfg->binary, sizeof(cfg->binary), "%s", pre.binary);
+    snprintf(cfg->memory_path, sizeof(cfg->memory_path), "%s", pre.memory_path);
+    cfg->g_scale = pre.g_scale;
+    cfg->tgt_budget = pre.tgt_budget;
+    cfg->ph_tonic = pre.ph_tonic;
+    cfg->ph_optic_gain = pre.ph_optic_gain;
+    cfg->emd_gain = pre.emd_gain;
+    cfg->dan_mod_gain = pre.dan_mod_gain;
+    cfg->dopa_gain = pre.dopa_gain;
+    cfg->dan_base_tau_s = pre.dan_base_tau_s;
+    cfg->dan_tonic_mv = pre.dan_tonic_mv;
+    cfg->learning = pre.learning;
+    cfg->tick_cost_seed_ms = pre.tick_cost_seed_ms;
+    cfg->sim_speed = pre.sim_speed;
+    cfg->max_bio_ms = pre.max_bio_ms;
+    cfg->autosave_s = pre.autosave_s;
+    cfg->ws_port = pre.ws_port;
+    cfg->rest_port = pre.rest_port;
+
+    /* push the embodiment-scoped overlay into the live runtime (the
+     * loop thread reads rt->cfg + rt->ch[] under this lock) */
+    fb_rt_lock(rt);
+    rt->cfg = *cfg;
+    rt->n_channels = cfg->n_channels;
+    for (int i = 0; i < cfg->n_channels; i++) {
+        snprintf(rt->ch[i].name, sizeof(rt->ch[i].name), "%s", cfg->channels[i]);
+        rt->ch[i].value = cfg->ch_default[i];
+    }
+    /* motor pools are circuit-attached: rebuild them from the new
+     * declaration, carrying learned pool weights across the switch (they
+     * persist like synapse memory). Same lock: fb_pools_* run on the loop
+     * thread's data between its ticks. */
+    {
+        char (*nm)[32] = (char (*)[32])malloc(4096 * sizeof(*nm));
+        double *wv = NULL;
+        int nw = 0;
+        int had = nm ? fb_pools_export(rt->net, nm, 4096, &wv, &nw) : 0;
+        FbPoolCfg pcfg[8];
+        int npcfg = 0;
+        for (int i = 0; i < cfg->n_pools; i++) {
+            snprintf(pcfg[npcfg].group, sizeof(pcfg[npcfg].group), "%s",
+                     cfg->pools[i].group);
+            pcfg[npcfg].every = cfg->pools[i].every;
+            pcfg[npcfg].split_lr = cfg->pools[i].split_lr;
+            pcfg[npcfg].which = cfg->pools[i].which;
+            npcfg++;
+        }
+        fb_pools_configure(rt->net, pcfg, npcfg,
+                           cfg->pool_integrate_ms, cfg->pool_learn);
+        if (had > 0 && nw > 0) fb_pools_import(rt->net, nm, wv, nw);
+        free(wv);
+        free(nm);
+        /* fresh file that predates any pool config: back-fill from disk
+         * (file read + import run under the held lock — the loop thread
+         * must not tick pools concurrently with the import) */
+        if (!rt->pools_restored) fb_runtime_pools_restore_from_disk(rt);
+        rt->pools_restored = rt->pools_restored || rt->net->n_pools > 0;
+    }
+    fb_rt_unlock(rt);
+
+    fprintf(stderr, "config: applied embodiment profile %s (%d channels:",
+            profile_path, cfg->n_channels);
+    for (int i = 0; i < cfg->n_channels; i++)
+        fprintf(stderr, " %s", cfg->channels[i]);
+    fprintf(stderr, ", %d map entries, %d pools)\n", cfg->n_map, cfg->n_pools);
 }

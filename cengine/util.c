@@ -119,10 +119,13 @@ int fb_send_all(int fd, const uint8_t *buf, size_t len) {
 #else
         ssize_t n = send(fd, buf + off, len - off, 0);
 #endif
-        if (n <= 0) return -1;
-        off += (size_t)n;
+        if (n > 0) { off += (size_t)n; continue; }
+        /* would-block on a non-blocking socket: report progress so callers
+         * can drop the whole frame instead of writing a partial one (a
+         * truncated WS frame desynchronizes the client's parser) */
+        return off > 0 ? (int)off : -1;
     }
-    return 0;
+    return (int)off;
 }
 
 int fb_wait_readable(int fd, int timeout_ms) {

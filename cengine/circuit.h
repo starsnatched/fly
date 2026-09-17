@@ -8,6 +8,8 @@
 #define FB_V_REST (-70.0f)
 #define FB_V_RESET (-62.0f)
 
+typedef struct FbPool FbPool;   /* defined in circuit.c (motor pools) */
+
 typedef struct {
     float g_scale;        /* peak PSP (mV) per unit normalized weight */
     float tgt_budget;     /* total PSP stamp per target neuron (mV) */
@@ -130,6 +132,17 @@ typedef struct {
     uint8_t *dn_l_mask, *dn_r_mask;
     float dn_l_rate, dn_r_rate;
 
+    /* motor pools: DIRECT per-neuron actuator channels (readout.pools).
+     * Each pool integrates spikes from its selected neurons into a leaky
+     * accumulator — motor-unit temporal summation — and that integral is
+     * the raw actuator signal (per-embodiment gain/offset are applied in
+     * the runtime readout). Pool weights are PLASTIC: shaped by the same
+     * self-regulated dopamine signal that drives R-STDP, so the circuit
+     * learns its own body map. The pool array is owned by the circuit;
+     * the runtime points fb_runtime_pools at it and configures it. */
+    FbPool *pools;
+    int n_pools;
+
     /* delay queues: flat id arrays; slot[k] delivers after k+1 more ticks */
     int64_t *pend0_cur, *pend0_next;
     int pend0_cur_n, pend0_next_n, pend0_cap, pend0_next_cap;
@@ -198,5 +211,44 @@ int fb_learn_stats(const FbCircuit *n, float *lo, float *hi);
 int fb_export_memory(const FbCircuit *n, int **out_idx, double **out_w, int *out_n);
 int fb_load_memory(FbCircuit *n, const int *idx, const double *w, int count);
 void fb_reset_plasticity(FbCircuit *n);
+
+/* ---- motor pools (readout.pools): direct neuron->actuator channels ----
+ *
+ * A pool is a set of neurons from ONE group whose spikes integrate into a
+ * leaky accumulator; the accumulator IS the actuator signal (the runtime
+ * readout scales it per embodiment). With "learn":true the pool's neurons
+ * own a plastic dopamine-gated weight each (multiplicative, same soft
+ * bounds as synapse learning), so the brain calibrates its own body map.
+ *
+ * config:  pools JSON array -> FbPoolCfg descriptions
+ * returns: number of pools built (0 = none declared / no group)
+ *
+ * pick selects from the group's neuron ids in ascending id order:
+ *   {"every":k}            one neuron of every k (even coverage)
+ *   {"split":"lr"}         neurons partitioned by connectome side:
+ *                          pool 0 = left half, pool 1 = right half
+ *                          (a pool with "pool":1 takes the right half)
+ *   default               the whole group
+ * Side note: "motor" neurons have side==1 (VNC); split-lr falls back to
+ * "every":2 there, still giving a signed differential pair. */
+typedef struct {
+    char group[32];
+    int every;        /* >0: take one of every k */
+    int split_lr;     /* 1: partition by connectome side (pool 0 = left) */
+    int which;        /* which half for split_lr (0 = left, 1 = right) */
+} FbPoolCfg;
+
+int fb_pools_configure(FbCircuit *n, const FbPoolCfg *cfgs, int n_cfgs,
+                       int integrate_ms, int learn);
+FbPool *fb_runtime_pools(FbCircuit *n);   /* live pool array (or NULL) */
+int fb_pools_count(const FbCircuit *n);
+/* current leaky integrals (called with the runtime lock held) */
+void fb_pools_snapshot(const FbCircuit *n, float *out, int cap);
+
+/* memory (pool weights ride in the same JSON file as synapse memory) */
+int fb_pools_export(FbCircuit *n, char (*names)[32], int max_names,
+                    double **out_w, int *out_n);
+int fb_pools_import(FbCircuit *n, char (*names)[32], const double *w, int count);
+void fb_pools_reset(FbCircuit *n);
 
 #endif

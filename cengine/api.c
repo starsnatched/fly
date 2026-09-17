@@ -349,6 +349,21 @@ static void rest_handle(FbApi *api, int fd, const char *req) {
         http_send(fd, "200 OK", "application/json", "{\"ok\":true}", 11);
         return;
     }
+    /* ---- POST /reward: artificial reward / punishment ----------------
+     * v > 0 rewards (DAN excitability up, the circuit's own dopa signal
+     * turns positive -> LTP); v < 0 punishes. Pulses decay over
+     * ~1/rewardDecayPerS seconds so constant inputs stop teaching. */
+    char rew_path[256];
+    float rew_val;
+    if (sscanf(req, "POST %255s %f", rew_path, &rew_val) == 2 &&
+        strcmp(rew_path, "/reward") == 0) {
+        fb_runtime_apply_reward(api->rt, rew_val);
+        char body[96];
+        int bl = snprintf(body, sizeof(body),
+                          "{\"ok\":true,\"reward\":%.3f}", rew_val);
+        http_send(fd, "200 OK", "application/json", body, (size_t)bl);
+        return;
+    }
     char path[256];
     if (sscanf(req, "GET %255s", path) != 1) {
         http_send(fd, "400 Bad Request", "text/plain", "bad", 3);

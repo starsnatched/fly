@@ -99,6 +99,10 @@ typedef struct {
     /* optic-lobe ambient mask */
     uint8_t *optic_mask;
 
+    /* mechanosensory population ("sensory" superclass) + burst state */
+    uint8_t *sensory_set;
+    float touch_blast_mV;
+
     /* DAN pathway */
     int64_t *dan_idx;
     int dan_n;
@@ -177,6 +181,7 @@ int fb_tick(FbCircuit *n, const float *rgb_l, const float *rgb_r,
 void fb_learn_step(FbCircuit *n);
 
 void fb_apply_reward(FbCircuit *n, float r);
+void fb_circuit_sensory_burst(FbCircuit *n, float mv);
 void fb_apply_dan_bias(FbCircuit *n, float r);
 void fb_set_learning(FbCircuit *n, int on);
 

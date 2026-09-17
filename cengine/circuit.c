@@ -220,10 +220,12 @@ FbCircuit *fb_circuit_new(const FbConnectome *c, const FbParams *p) {
     /* --- delays, depression, masks --- */
     n->delay_ticks = (int8_t *)malloc((size_t)N);
     n->optic_mask = (uint8_t *)calloc((size_t)N, 1);
+    n->sensory_set = (uint8_t *)calloc((size_t)N, 1);
     for (int i = 0; i < N; i++) {
         const char *g = c->groups[n->grp[i]];
         n->delay_ticks[i] = is_delay1(g) ? 1 : (is_delay2(g) ? 2 : 0);
         n->optic_mask[i] = (uint8_t)optic_group(g);
+        if (strcmp(g, "sensory") == 0) n->sensory_set[i] = 1;
     }
     n->dep_res = (float *)malloc((size_t)E * 4);
     for (int e = 0; e < E; e++) n->dep_res[e] = 1.0f;
@@ -426,6 +428,7 @@ FbCircuit *fb_circuit_new(const FbConnectome *c, const FbParams *p) {
 
     n->sim_ms = 0;
     n->last_dn_l = n->last_dn_r = 0;
+    n->touch_blast_mV = 0.0f;
     return n;
 }
 
@@ -454,6 +457,7 @@ void fb_circuit_free(FbCircuit *n) {
     free(n->dn_l_mask); free(n->dn_r_mask);
     free(n->i_ext); free(n->noise); free(n->vm_next); free(n->vth_eff);
     free(n->fire); free(n->fired);
+    free(n->sensory_set);
     free(n->pend0_cur); free(n->pend0_next);
     for (int d = 0; d < 2; d++) { free(n->dcur[d]); free(n->dnext[d]); }
     free(n);
@@ -485,6 +489,12 @@ void fb_emd_flow(const FbCircuit *n, float *hL, float *hR, float *vL, float *vR)
 void fb_apply_reward(FbCircuit *n, float r) {
     n->reward = clampf(n->reward + r, -2.0f, 2.0f);
     n->dan_drive = clampf(n->dan_drive + r, -1.5f, 1.5f);
+}
+
+/* brief mechanosensory burst (the collision/tap sensory pathway) */
+void fb_circuit_sensory_burst(FbCircuit *n, float mv) {
+    if (mv == 0.0f) return;
+    n->touch_blast_mV = mv;
 }
 
 /* EXTERNAL signals (environment reward, REST/WS injections) enter only as a
@@ -573,6 +583,12 @@ int fb_tick(FbCircuit *n, const float *rgb_l, const float *rgb_r, int gw, int gh
          * the SELF-regulated dopamine loop meaningful — external signals
          * modulate an already-living system instead of creating it. */
         if (n->dan_set[i]) base += n->p.dan_tonic_mv;
+        /* mechanosensory startle: a bump/tap injects a brief depolarizing
+         * burst into the sensory population — like bristle/joint receptor
+         * currents. The connectome's own wiring propagates the event into
+         * behavior (VNC/DNs) and reward circuits; nothing is scripted. */
+        if (n->touch_blast_mV != 0.0f && n->sensory_set[i])
+            base += n->touch_blast_mV;
         n->i_ext[i] = base;
     }
 
@@ -836,6 +852,11 @@ int fb_tick(FbCircuit *n, const float *rgb_l, const float *rgb_r, int gw, int gh
     if (n->dan_drive != 0.0f) {
         n->dan_drive *= expf(-dt / 300.0f);
         if (fabsf(n->dan_drive) < 1e-3f) n->dan_drive = 0.0f;
+    }
+    /* mechanosensory burst decays with receptor-like kinetics (~40 ms) */
+    if (n->touch_blast_mV != 0.0f) {
+        n->touch_blast_mV *= expf(-dt / 40.0f);
+        if (fabsf(n->touch_blast_mV) < 1e-3f) n->touch_blast_mV = 0.0f;
     }
     if (n->reward != 0.0f) {
         n->reward *= expf(-dt / n->p.tau_dopa_ms);

@@ -32,6 +32,9 @@ interface SendGrid {
   t: number;
 }
 
+/** Eye-frame streaming rate — mirrors sensors.visionHz in config/flybrain.json. */
+const VISION_HZ = 120;
+
 export class RemoteBrain {
   readonly remote = true;
   readonly fullMode = true;
@@ -55,7 +58,7 @@ export class RemoteBrain {
   constructor(
     url: string,
     private stats: () => {
-      altitude: number; vy: number; clearance: number; collision: boolean;
+      altitude: number; vy: number; collision: boolean;
       rgbL: Float32Array; rgbR: Float32Array;
     },
     onReady?: () => void,
@@ -157,26 +160,41 @@ export class RemoteBrain {
   /** Called each frame with current state; returns the latest command. */
   step(dt: number): Cmd {
     this.sendAccum += dt;
-    // stream the eye frame every ~33 ms (30 fps)
-    if (this.sendAccum >= 1 / 30 && this.ws.readyState === WebSocket.OPEN) {
+    // stream the eye pair at VISION_HZ (matches sensors.visionHz on the
+    // server; 120 Hz keeps the EMD correlators well above frame rate)
+    if (this.sendAccum >= 1 / VISION_HZ && this.ws.readyState === WebSocket.OPEN) {
       this.sendAccum = 0;
       const s = this.stats();
       this.sendEye(0, s.rgbL); // left eye
       this.sendEye(1, s.rgbR); // right eye
+      // body state: ONLY what a real drone can sense — altitude (barometer),
+      // climb rate (IMU), contact events (bumper). No clearance: the brain
+      // estimates obstacle distance itself from optic flow.
       this.ws.send(JSON.stringify({
         type: "state", altitude: s.altitude, vy: s.vy,
-        clearance: s.clearance, collision: s.collision,
+        collision: s.collision,
       }));
       this.seq++;
     }
     return this.latest;
   }
 
+  /** Artificial reward / punishment through the REST API.
+   * v > 0 rewards (LTP window), v < 0 punishes; the server scales by
+   * rewardGain and decays the pulse over ~1/rewardDecayPerS seconds. */
+  async pulseReward(v: number): Promise<void> {
+    if (!this.connected) return;
+    try {
+      const base = this.url.replace(/^ws/, "http").replace(/\/stream$/, "");
+      await fetch(`${base}/reward/${v}`, { method: "POST" });
+    } catch { /* offline; surfaced via status() */ }
+  }
+
   /** Stream one eye frame (eye 0 = left, eye 1 = right). */
   private sendEye(eye: number, arr: Float32Array): void {
     const now = performance.now();
     const last = this.lastGrid[eye];
-    if (last && now - last.t < 100) return;
+    if (last && now - last.t < 0.5 * 1000 / VISION_HZ) return; // guard at half-period
     const w = RENDER_W, h = RENDER_H;
     const pkt = new Uint8Array(6 + w * h * 3);
     pkt[0] = 1; // MSG_FRAME

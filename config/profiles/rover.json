@@ -2,14 +2,8 @@
   "readout": {
     "dnHzScale": 8.0,
     "turnGain": 6.0,
-    "saccadeRate": 0.30,
-    "saccadeYaw": 0.9,
-    "saccadeRoll": 0.0,
-    "wanderTau": 5.0,
-    "wanderAmp": 0.6,
-    "altGain": 0.0,
-    "altDamp": 0.0,
-    "targetAlt": 0.0
+    "optoYawGain": 0.5,
+    "optoFwdGain": 0.12
   },
   "actuators": {
     "channels": [
@@ -18,18 +12,19 @@
     ]
   },
   "sensors": {
+    "visionHz": 120,
     "eyes": { "count": 1, "leftId": 0, "rightId": 1 },
+    "touch": { "burstMv": 6.0, "holdMs": 40 },
     "scalarRanges": {
       "altitude": [0.0, 1.0],
       "speed": [0.0, 4.0],
       "vy": [-2.0, 2.0],
-      "clearance": [0.0, 25.0]
+      "clearance": [0.0, 25.0],
+      "tauScale": 9.0
     }
   },
   "reward": {
-    "openSkyStart": 0.15,
-    "openSkyEnd": 0.6,
-    "openSkyReward": 0.4,
-    "bumpPenalty": -0.6
+    "rewardGain": 0.3,
+    "rewardDecayPerS": 0.8
   }
 }

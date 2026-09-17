@@ -30,16 +30,17 @@ const bar = (id: string, v: number) => {
   (el(id) as HTMLElement).style.width = `${Math.round(Math.max(0, Math.min(1, v)) * 100)}%`;
 };
 
-/** State the remote brain needs each frame (eye RGB + proprioception). */
+/** State the remote brain needs each frame (eye RGB + proprioception).
+ * ONLY drone-obtainable data: cameras, barometer altitude, IMU climb rate,
+ * bumper contact events. Clearance is the brain's own optic-flow estimate. */
 function remoteStats(): {
-  altitude: number; vy: number; clearance: number; collision: boolean;
+  altitude: number; vy: number; collision: boolean;
   rgbL: Float32Array; rgbR: Float32Array;
 } {
   const rgb = vision.rgb;
   return {
     altitude: drone.pos.y - WORLD.groundY,
     vy: drone.vel.y,
-    clearance: clearanceAhead(drone.pos, drone.yaw),
     collision: false,
     rgbL: rgb.L, rgbR: rgb.R, // stereo pair: both eyes streamed
   };
@@ -81,6 +82,14 @@ async function init(): Promise<void> {
     if (e.key.toLowerCase() === "m") {
       brain.wipeMemory();
       flashBadge("MEMORY WIPED");
+    }
+    if (e.key.toLowerCase() === "u") {
+      void brain.pulseReward(1.0);
+      flashBadge("REWARD +1.0");
+    }
+    if (e.key.toLowerCase() === "j") {
+      void brain.pulseReward(-1.0);
+      flashBadge("PUNISH −1.0");
     }
   });
   window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));

@@ -24,7 +24,6 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
     }
     cfg->sim_speed = (float)fb_json_num(root, "simSpeed", 1.0);
     cfg->max_bio_ms = (float)fb_json_num(root, "maxBioMsPerTick", 20.0);
-    cfg->reward_period_s = (float)fb_json_num(root, "rewardPeriodS", 0.25);
     cfg->autosave_s = (float)fb_json_num(root, "autosaveS", 5.0);
     snprintf(cfg->memory_path, sizeof(cfg->memory_path), "%s",
              fb_json_str(root, "memoryPath", "state/brain-memory.json"));
@@ -36,6 +35,11 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
             cfg->eye_count = (int)fb_json_num(eyes, "count", (double)cfg->eye_count);
             cfg->eye_left_id = (int)fb_json_num(eyes, "leftId", 0);
             cfg->eye_right_id = (int)fb_json_num(eyes, "rightId", 1);
+        }
+        cfg->vision_hz = (float)fb_json_num(sens, "visionHz", (double)cfg->vision_hz);
+        const FbJson *touch = fb_json_get(sens, "touch");
+        if (touch) {
+            cfg->touch_gain = (float)fb_json_num(touch, "burstMv", (double)cfg->touch_gain);
         }
         const FbJson *rng = fb_json_get(sens, "scalarRanges");
         if (rng) {
@@ -56,27 +60,24 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
                 cfg->range_clr[0] = (float)a->items[0]->num;
                 cfg->range_clr[1] = (float)a->items[1]->num;
             }
+            cfg->tau_scale = (float)fb_json_num(rng, "tauScale", (double)cfg->tau_scale);
         }
     }
 
     const FbJson *ro = fb_json_get(root, "readout");
     if (ro) {
-        cfg->dn_hz_scale = (float)fb_json_num(ro, "dnHzScale", 8.0);
+        cfg->dn_hz_scale = (float)fb_json_num(ro, "dnHzScale", (double)cfg->dn_hz_scale);
         const FbJson *hov = fb_json_get(ro, "hover");
         if (hov) {
-            cfg->hover_throttle = (float)fb_json_num(hov, "throttle", 0.55);
-            cfg->hover_pitch = (float)fb_json_num(hov, "pitch", -0.2);
+            cfg->hover_throttle = (float)fb_json_num(hov, "throttle", (double)cfg->hover_throttle);
+            cfg->hover_pitch = (float)fb_json_num(hov, "pitch", (double)cfg->hover_pitch);
         }
-        cfg->alt_gain = (float)fb_json_num(ro, "altGain", 0.55);
-        cfg->alt_damp = (float)fb_json_num(ro, "altDamp", 0.30);
-        cfg->target_alt = (float)fb_json_num(ro, "targetAlt", 4.0);
-        cfg->cruise_pitch = (float)fb_json_num(ro, "cruisePitch", -0.2);
-        cfg->turn_gain = (float)fb_json_num(ro, "turnGain", 6.0);
-        cfg->saccade_rate = (float)fb_json_num(ro, "saccadeRate", 0.22);
-        cfg->saccade_yaw = (float)fb_json_num(ro, "saccadeYaw", 0.85);
-        cfg->saccade_roll = (float)fb_json_num(ro, "saccadeRoll", 0.6);
-        cfg->wander_tau = (float)fb_json_num(ro, "wanderTau", 4.0);
-        cfg->wander_amp = (float)fb_json_num(ro, "wanderAmp", 0.5);
+        cfg->alt_damp = (float)fb_json_num(ro, "altDamp", (double)cfg->alt_damp);
+        cfg->cruise_pitch = (float)fb_json_num(ro, "cruisePitch", (double)cfg->cruise_pitch);
+        cfg->turn_gain = (float)fb_json_num(ro, "turnGain", (double)cfg->turn_gain);
+        cfg->opto_yaw_gain = (float)fb_json_num(ro, "optoYawGain", (double)cfg->opto_yaw_gain);
+        cfg->opto_fwd_gain = (float)fb_json_num(ro, "optoFwdGain", (double)cfg->opto_fwd_gain);
+        cfg->opto_climb_gain = (float)fb_json_num(ro, "optoClimbGain", (double)cfg->opto_climb_gain);
     }
 
     const FbJson *act = fb_json_get(root, "actuators");
@@ -98,10 +99,9 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
 
     const FbJson *rew = fb_json_get(root, "reward");
     if (rew) {
-        cfg->open_sky_start = (float)fb_json_num(rew, "openSkyStart", 0.1);
-        cfg->open_sky_end = (float)fb_json_num(rew, "openSkyEnd", 0.5);
-        cfg->open_sky_reward = (float)fb_json_num(rew, "openSkyReward", 0.35);
-        cfg->bump_penalty = (float)fb_json_num(rew, "bumpPenalty", -0.5);
+        /* reward PATHWAY knobs only — there is no reward shaping anywhere */
+        cfg->reward_gain = (float)fb_json_num(rew, "rewardGain", (double)cfg->reward_gain);
+        cfg->reward_decay_per_s = (float)fb_json_num(rew, "rewardDecayPerS", (double)cfg->reward_decay_per_s);
     }
     const FbJson *net = fb_json_get(root, "network");
     if (net) {
@@ -112,26 +112,29 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
 
 int fb_config_load(FbConfig *cfg, const char *path, const char *profile_path) {
     memset(cfg, 0, sizeof(*cfg));
-    /* hard defaults (mirroring server/config.json) */
+    /* hard defaults (mirroring config/flybrain.json) */
     snprintf(cfg->binary, sizeof(cfg->binary), "data/fly-brain-full.bin");
     cfg->g_scale = 0.30f; cfg->tgt_budget = 36.0f;
     cfg->ph_tonic = 5.0f; cfg->ph_optic_gain = 2.0f; cfg->emd_gain = 10.0f;
     cfg->dan_mod_gain = 0.6f; cfg->learning = 1; cfg->tick_cost_seed_ms = 30.0f;
     cfg->dopa_gain = 0.09f; cfg->dan_base_tau_s = 8.0f; cfg->dan_tonic_mv = 3.0f;
     cfg->sim_speed = 1.0f; cfg->max_bio_ms = 20.0f;
-    cfg->reward_period_s = 0.25f; cfg->autosave_s = 5.0f;
+    cfg->autosave_s = 5.0f;
+    cfg->reward_gain = 0.30f; cfg->reward_decay_per_s = 0.8f;
     snprintf(cfg->memory_path, sizeof(cfg->memory_path), "state/brain-memory.json");
     cfg->eye_count = 2;
     cfg->eye_left_id = 0; cfg->eye_right_id = 1;
+    cfg->vision_hz = 120.0f;
     cfg->range_alt[0] = 0; cfg->range_alt[1] = 30;
     cfg->range_speed[0] = 0; cfg->range_speed[1] = 18;
     cfg->range_vy[0] = -8; cfg->range_vy[1] = 8;
     cfg->range_clr[0] = 0; cfg->range_clr[1] = 60;
-    cfg->dn_hz_scale = 8.0f; cfg->hover_throttle = 0.55f; cfg->hover_pitch = -0.2f;
-    cfg->alt_gain = 0.55f; cfg->alt_damp = 0.30f; cfg->target_alt = 4.0f;
+    cfg->tau_scale = 9.0f;
+    cfg->touch_gain = 6.0f;
+    cfg->dn_hz_scale = 8.0f; cfg->hover_throttle = 0.29f; cfg->hover_pitch = -0.2f;
+    cfg->alt_damp = 1.2f;
     cfg->cruise_pitch = -0.2f; cfg->turn_gain = 6.0f;
-    cfg->saccade_rate = 0.22f; cfg->saccade_yaw = 0.85f; cfg->saccade_roll = 0.6f;
-    cfg->wander_tau = 4.0f; cfg->wander_amp = 0.5f;
+    cfg->opto_yaw_gain = 0.5f; cfg->opto_fwd_gain = 0.12f; cfg->opto_climb_gain = 0.17f;
     cfg->n_channels = 4;
     snprintf(cfg->channels[0], 32, "throttle");
     snprintf(cfg->channels[1], 32, "pitch");
@@ -143,8 +146,6 @@ int fb_config_load(FbConfig *cfg, const char *path, const char *profile_path) {
         cfg->ch_default[i] = 0;
     }
     cfg->ch_default[1] = -0.35f;
-    cfg->open_sky_start = 0.1f; cfg->open_sky_end = 0.5f;
-    cfg->open_sky_reward = 0.35f; cfg->bump_penalty = -0.5f;
     cfg->ws_port = 8787;
     cfg->rest_port = 8788;
 

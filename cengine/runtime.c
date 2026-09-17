@@ -111,119 +111,91 @@ typedef struct {
     float hL, hR, vL, vR;
 } EmdFlow;
 
+/* Readout: NEURAL STATE -> ACTUATOR CHANNELS, and nothing else.
+ * Every signal here is a population activity INSIDE the circuit — the same
+ * thing an electrophysiologist would decode from descending neurons and the
+ * optic lobe. There are no scripted behaviors, no set points, no reflex
+ * gains computed from raw sensors: vision and touch enter the circuit as
+ * neural input, and all behavior is what the connectome (plus R-STDP
+ * memory) does with them.
+ *
+ * Which population feeds which channel is a per-embodiment DECLARATION in
+ * config (readout.map), because that mapping is anatomy, not policy:
+ *   dnDrive    descending-population rate (normalized 0..1)
+ *   motorDrive motor-population rate (normalized 0..1)
+ *   dnSteer    left-vs-right descending rate asymmetry (-1..1)
+ *   flowYaw    T4/T5 horizontal flow, right-vs-left difference
+ *   flowRoll   T4/T5 whole-field horizontal flow (optic-lobe consensus)
+ *   flowPitch  T4/T5 vertical flow (optic-lobe consensus)
+ *   touch      mechanosensory burst envelope (0..1)
+ * A channel maps to: offset + gain*signal1 + gain*signal2 + ... (summed),
+ * then clamped to the channel's configured range and slewed. */
+
+enum {
+    SIG_DN_DRIVE, SIG_MOTOR_DRIVE, SIG_DN_STEER,
+    SIG_FLOW_YAW, SIG_FLOW_ROLL, SIG_FLOW_PITCH, SIG_TOUCH,
+    SIG_COUNT
+};
+
+static const char *SIG_NAMES[SIG_COUNT] = {
+    "dnDrive", "motorDrive", "dnSteer",
+    "flowYaw", "flowRoll", "flowPitch", "touch",
+};
+
+static int signal_index(const char *name) {
+    for (int i = 0; i < SIG_COUNT; i++)
+        if (strcmp(SIG_NAMES[i], name) == 0) return i;
+    return -1;
+}
+
 static void readout_compute(FbRuntime *rt, float *out /* n_channels */) {
     const FbConfig *cfg = &rt->cfg;
     FbCircuit *net = rt->net;
     for (int i = 0; i < rt->n_channels; i++) out[i] = 0.0f;
 
+    /* ---- decode the circuit's own state ---- */
+    float sig[SIG_COUNT] = {0};
     float dn = fb_rate_of(net, "descending");
     float motor = fb_rate_of(net, "motor");
-    float drive = (0.6f * dn + 0.4f * motor) / cfg->dn_hz_scale;
-    if (drive > 1.0f) drive = 1.0f;
-    float lat = fb_dn_steer(net);
+    sig[SIG_DN_DRIVE] = clampf(dn / cfg->dn_hz_scale, 0.0f, 1.0f);
+    sig[SIG_MOTOR_DRIVE] = clampf(motor / cfg->dn_hz_scale, 0.0f, 1.0f);
+    sig[SIG_DN_STEER] = fb_dn_steer(net);
     EmdFlow f;
     fb_emd_flow(net, &f.hL, &f.hR, &f.vL, &f.vR);
-    float h_flow = f.hR - f.hL;
-    float v_flow = 0.5f * (f.vL + f.vR);
-    float avoid = tanhf(cfg->turn_gain * h_flow);
+    sig[SIG_FLOW_YAW] = f.hR - f.hL;
+    sig[SIG_FLOW_ROLL] = f.hL + f.hR;
+    sig[SIG_FLOW_PITCH] = 0.5f * (f.vL + f.vR);
+    sig[SIG_TOUCH] = cfg->touch_gain > 0.0f
+        ? clampf(net->touch_blast_mV / cfg->touch_gain, 0.0f, 1.0f) : 0.0f;
 
-    /* ---- flight gait: spontaneous saccades + OU heading wander --------
-     * Real flies do not fly straight: They interleave straight segments
-     * with rapid, stereotyped body-saccades and a slowly wandering heading
-     * set point. Without this the readout is a constant and the body only
-     * ever translates forward. */
-    double dt = 1.0 / 60.0;
-    rt->rng ^= rt->rng << 13; rt->rng ^= rt->rng >> 7; rt->rng ^= rt->rng << 17;
-    float urand = (float)((rt->rng >> 11) * (1.0 / 9007199254740992.0)); /* 53-bit uniform 0..1 */
-    /* OU wander: bias += (-bias/tau)*dt + amp*sqrt(dt)*gauss */
-    float g1 = 2.0f * urand - 1.0f;
-    rt->rng ^= rt->rng << 13; rt->rng ^= rt->rng >> 7; rt->rng ^= rt->rng << 17;
-    float g2 = 2.0f * (float)((rt->rng >> 11) * (1.0 / 9007199254740992.0)) - 1.0f;
-    rt->wander_bias += (-rt->wander_bias / cfg->wander_tau) * (float)dt
-                     + cfg->wander_amp * 0.32f * (float)(dt * 2.236) * (g1 + g2);
-    if (rt->wander_bias > 1.0f) rt->wander_bias = 1.0f;
-    if (rt->wander_bias < -1.0f) rt->wander_bias = -1.0f;
-    /* saccade state machine */
-    if (rt->saccade_left > 0.0f) {
-        rt->saccade_left -= (float)dt;
-        if (rt->saccade_left <= 0.0f) { rt->saccade_left = 0.0f; rt->saccade_cooldown = 1.2f; }
-    } else {
-        rt->saccade_cooldown -= (float)dt;
-        if (rt->saccade_cooldown <= 0.0f &&
-            urand < cfg->saccade_rate * (float)dt) {
-            rt->saccade_left = 0.18f;
-            rt->saccade_dir = (rt->rng & 1) ? 1.0f : -1.0f;
-            rt->wander_bias = 0.55f * rt->saccade_dir; /* bias the next heading */
-        }
+    /* ---- the declared decode map: population -> channel ---- */
+    float yaw_cmd = 0.0f;
+    for (int m = 0; m < cfg->n_map; m++) {
+        const FbMapEntry *e = &cfg->map[m];
+        int ch = -1;
+        for (int i = 0; i < rt->n_channels; i++)
+            if (strcmp(rt->ch[i].name, e->channel) == 0) { ch = i; break; }
+        if (ch < 0) continue;
+        out[ch] += e->offset + e->gain * sig[e->signal];
     }
-    float sacc = rt->saccade_left > 0.0f ? rt->saccade_dir : 0.0f;
-    /* looming escape ladder (the descending-neuron collision response):
-     * far     (>8 m):  cruise, no interference with spontaneous behavior
-     * brake   (<8 m):  decelerate — flies slow down before anything else
-     * retreat (<1 m):  positive pitch = back away, only at contact range
-     * Escape SUPPRESSES spontaneous behavior — saccades and wander must not
-     * fight the reflex near obstacles. */
-    float clr = rt->sens.clearance;
-    float brake = tanhf((8.0f - clr) / 4.0f);
-    if (brake < 0.0f) brake = 0.0f;
-    float retreat = tanhf((1.0f - clr) / 0.5f);
-    if (retreat < 0.0f) retreat = 0.0f;
-    /* flies fly STRAIGHT between saccades: the saccade is the turn, the
-     * wander bias only adds a gentle residual curve (a large continuous
-     * bias makes the body orbit instead of translating forward) */
-    float spontaneous = 0.35f * lat + 0.25f * rt->wander_bias + sacc;
-    /* movement MAPPING (quadcopter): yaw REORIENTS the body, roll STRAFES.
-     * They must not receive the same signal, or the drone spins and slips
-     * sideways at once and never flies forward. Yaw carries the full turn
-     * state (avoid + escape-veer + spontaneous saccade/wander); roll leans
-     * only for obstacle-driven escape. Spontaneous behavior is suppressed
-     * near obstacles by the brake gate, as in real flies. */
-    float turn = avoid + retreat * (h_flow >= 0.0f ? -1.0f : 1.0f) /* veer from the closer side */
-               + spontaneous * (1.0f - brake);
-    if (turn > 1.0f) turn = 1.0f;
-    if (turn < -1.0f) turn = -1.0f;
-    float lean = avoid + retreat * (h_flow >= 0.0f ? -1.0f : 1.0f) * 0.6f;
-    if (lean > 1.0f) lean = 1.0f;
-    if (lean < -1.0f) lean = -1.0f;
-    rt->last_turn_cmd = turn;
-
-    float alt_now = rt->sens.altitude;
-    /* climb only helps when there is sky above the target; past that the
-     * escape must be horizontal (retreat + veer), or we pin at the ceiling */
-    float brake_climb = retreat * (alt_now < cfg->target_alt + 2.0f ? 1.0f : 0.0f);
+    /* clamp here too; actuators_apply applies the channel slew after */
     for (int i = 0; i < rt->n_channels; i++) {
-        const char *name = rt->ch[i].name;
-        if (strcmp(name, "throttle") == 0) {
-            /* altitude hold: hover + linear climb-rate set point.
-             * LINEAR around hover (no tanh threshold): with hover 0.29 and
-             * 9.81/34 = 0.29 the balance point sits mid-range, so ±0.18 of
-             * authority reaches BOTH floor and ceiling without saturating
-             * into a bang-bang relay. Yaw turns bleed lift, so add a small
-             * agility trim proportional to |turn|. */
-            float climb_sp = cfg->alt_gain * (cfg->target_alt - alt_now) - cfg->alt_damp * rt->sens.vy;
-            if (climb_sp > 6.0f) climb_sp = 6.0f;
-            if (climb_sp < -6.0f) climb_sp = -6.0f;
-            float v = cfg->hover_throttle + climb_sp / 34.0f
-                    + 0.04f * fabsf(turn) / 34.0f * 9.81f /* turn agility trim */
-                    + 0.17f * tanhf(1.2f * v_flow)
-                    + 0.35f * brake_climb;
-            out[i] = clampf(v, 0.0f, 1.0f);
-        } else if (strcmp(name, "pitch") == 0) {
-            /* forward cruise dominates translation: cruise pitch (negative
-             * = tilt forward). Looming DECELERATES toward zero tilt and
-             * only RETREATS (positive pitch) at contact range. */
-            float fwd_cmd = cfg->cruise_pitch * (0.6f + 0.4f * drive);
-            if (fwd_cmd > 0.0f) fwd_cmd = 0.0f; /* drive never auto-backs */
-            float v = fwd_cmd * (1.0f - 0.75f * brake - 0.25f * retreat)
-                    + 0.9f * retreat;
-            out[i] = clampf(v, -1.0f, 0.6f);
-        } else if (strcmp(name, "roll") == 0) {
-            /* lean/strafe ONLY for obstacle escape — never with the yaw
-             * signal, or the drone slides sideways while turning */
-            out[i] = clampf(0.55f * lean, -1.0f, 1.0f);
-        } else if (strcmp(name, "yaw") == 0 || strcmp(name, "steer") == 0) {
-            out[i] = clampf(0.9f * turn, -1.0f, 1.0f);
-        }
+        if (out[i] < rt->cfg.ch_lo[i]) out[i] = rt->cfg.ch_lo[i];
+        if (out[i] > rt->cfg.ch_hi[i]) out[i] = rt->cfg.ch_hi[i];
+        if (strcmp(rt->ch[i].name, "yaw") == 0) yaw_cmd = out[i];
+    }
+    rt->last_turn_cmd = yaw_cmd;
+
+    /* tau (time-to-contact) percept for telemetry — an internal estimate
+     * from the EMD flow (looming = close); drives NO behavior directly */
+    if (rt->sens.coll_hold_s > 0.0) {
+        rt->sens.coll_hold_s -= 1.0 / 60.0;
+    } else {
+        float flow = fmaxf(fabsf(f.hL), fmaxf(fabsf(f.hR), fabsf(sig[SIG_FLOW_PITCH])));
+        float clr = flow > 1e-4f ? cfg->tau_scale / flow : cfg->range_clr[1];
+        if (clr < cfg->range_clr[0]) clr = cfg->range_clr[0];
+        if (clr > cfg->range_clr[1]) clr = cfg->range_clr[1];
+        rt->sens.clearance += 0.35f * (clr - rt->sens.clearance);
     }
 }
 
@@ -248,31 +220,15 @@ static void actuators_apply(FbRuntime *rt, const float *raw, double dt) {
 }
 
 /* ------------------------------------------------------------- reward */
-
-static float reward_from_state(FbRuntime *rt) {
-    const FbConfig *cfg = &rt->cfg;
-    float lo = cfg->range_clr[0], hi = cfg->range_clr[1];
-    float c = (rt->sens.clearance - lo) / (hi - lo > 1e-6f ? hi - lo : 1e-6f);
-    float open = (c - cfg->open_sky_start) /
-                 (cfg->open_sky_end - cfg->open_sky_start > 1e-6f
-                      ? cfg->open_sky_end - cfg->open_sky_start : 1e-6f);
-    if (open < 0) open = 0;
-    if (open > 1) open = 1;
-    /* PREDICTION ERROR, not raw reward: dopamine biology responds to the
-     * DIFFERENCE between actual and expected outcome. The baseline tracks
-     * the raw open-sky reward itself, so a CONSTANTLY-good situation pays
-     * ~0 (and slightly negative when things get worse) — without this, all
-     * synapses co-receive the same global signal and R-STDP edits them
-     * together (the "165k edited in seconds" artifact). */
-    float raw = cfg->open_sky_reward * open;
-    float r = raw - rt->sens.open_ema;
-    rt->sens.open_ema += (raw - rt->sens.open_ema) * 0.15f; /* baseline ~1.7 s */
-    if (rt->sens.collision) {
-        r += cfg->bump_penalty;
-        rt->sens.collision = 0;
-    }
-    return r;
-}
+/* NOTHING is shaped here. The dopamine teaching signal is computed inside
+ * the circuit from the DAN population's own firing vs. its adapting
+ * baseline (dopa_self). External influences are strictly sensory:
+ *   - POST /reward -> DAN excitability pathway (fb_apply_dan_bias),
+ *     exactly like an appetitive/aversive sensory input to PPL1/PAM;
+ *   - collisions  -> mechanosensory current into the sensory population
+ *     (fb_circuit_sensory_burst); the connectome's own wiring turns the
+ *     tap into a behavior- and reward-relevant event.
+ * What the brain LEARNS from these events is R-STDP + its own dopa. */
 
 /* ------------------------------------------------------------- memory */
 
@@ -375,18 +331,12 @@ FbRuntime *fb_runtime_new(const FbConfig *cfg) {
     rt->tick_cost_ema = cfg->tick_cost_seed_ms;
     rt->last_wall = fb_now();
     rt->mem_timer = cfg->autosave_s;
-    rt->reward_timer = cfg->reward_period_s;
     rt->rng = (uint64_t)(fb_now() * 1e6) ^ 0x9E3779B97F4A7C15ULL;
     if (!rt->rng) rt->rng = 0x2545F4914F6CDD1DULL;
     for (int i = 0; i < 8; i++) {
         rt->rng ^= rt->rng << 13; rt->rng ^= rt->rng >> 7; rt->rng ^= rt->rng << 17;
     }
-    rt->wander_bias = 0.0f;
-    rt->saccade_left = 0.0f;
-    rt->saccade_dir = 1.0f;
-    rt->saccade_cooldown = 2.0f;
     rt->last_turn_cmd = 0.0f;
-    rt->sens.open_ema = 0.0f;
     sensors_init(&rt->sens);
     rt->frames = 0;
     rt->restored = memory_restore(rt);
@@ -526,14 +476,13 @@ static void *loop_main(void *arg)
         double a = fabs(per_tick - rt->tick_cost_ema) > 0.5 * rt->tick_cost_ema ? 0.2 : 0.02;
         rt->tick_cost_ema += (per_tick - rt->tick_cost_ema) * a;
 
-        rt->reward_timer -= wall_ms / 1000.0;
-        if (rt->reward_timer <= 0) {
-            rt->reward_timer = rt->cfg.reward_period_s;
-            /* environment reward (open-sky + collisions) biases DAN
-             * excitability; the dopamine TEACHING signal is computed inside
-             * the circuit from DAN activity (dopa_self) */
-            float r = reward_from_state(rt);
-            if (r != 0) fb_apply_dan_bias(net, r);
+        /* collision -> mechanosensory startle: a brief current burst into
+         * the sensory population. The connectome's own wiring (sensory ->
+         * VNC -> descending, sensory -> central) propagates the event; any
+         * learning about it happens through the circuit's own dopa/R-STDP. */
+        if (rt->sens.collision) {
+            rt->sens.collision = 0;
+            fb_circuit_sensory_burst(net, rt->cfg.touch_gain);
         }
         rt->mem_timer -= wall_ms / 1000.0;
         if (rt->mem_timer <= 0) {
@@ -600,12 +549,14 @@ void fb_runtime_ingest_state(FbRuntime *rt, float altitude, float speed, float v
         if (vy > cfg->range_vy[1]) vy = cfg->range_vy[1];
         rt->sens.vy = vy;
     }
-    if (isfinite(clearance)) {
-        if (clearance < cfg->range_clr[0]) clearance = cfg->range_clr[0];
-        if (clearance > cfg->range_clr[1]) clearance = cfg->range_clr[1];
-        rt->sens.clearance = clearance;
+    /* NOTE: `clearance` is no longer accepted from clients. A real drone has
+     * no obstacle rangefinder; the brain estimates clearance itself from
+     * optic flow (time-to-contact) in readout_compute(). */
+    (void)clearance;
+    if (collision) {
+        rt->sens.collision = 1;
+        rt->sens.coll_hold_s = 0.5; /* bumper memory: penalty window */
     }
-    if (collision) rt->sens.collision = 1;
     rt_unlock(rt);
 }
 
@@ -649,7 +600,9 @@ int fb_runtime_import_memory(FbRuntime *rt, const FbJson *mem) {
 
 void fb_runtime_apply_reward(FbRuntime *rt, float r) {
     rt_lock(rt);
-    fb_apply_dan_bias(rt->net, r);
+    /* enters ONLY through the DAN excitability pathway — the circuit
+     * decides what (if anything) it means via its own dopa signal */
+    fb_apply_dan_bias(rt->net, rt->cfg.reward_gain * r);
     rt_unlock(rt);
 }
 
@@ -707,8 +660,6 @@ char *fb_runtime_telemetry_json(FbRuntime *rt) {
     fb_str_append_f(&s, net->last_dn_l - net->last_dn_r, 4);
     fb_str_append(&s, ",\"turn\":");
     fb_str_append_f(&s, rt->last_turn_cmd, 4);
-    fb_str_append(&s, ",\"saccade\":");
-    fb_str_append(&s, rt->saccade_left > 0.0f ? "true" : "false");
     fb_str_append(&s, ",\"flowH\":");
     fb_str_append_f(&s, net->flow_hR - net->flow_hL, 4);
     fb_str_append(&s, ",\"flowV\":");

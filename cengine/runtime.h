@@ -22,9 +22,9 @@ typedef struct {
     int samp_ok[2];
 
     /* scalar state */
-    float altitude, speed, vy, clearance;
+    float altitude, speed, vy, clearance; /* clearance is ESTIMATED from optic flow */
     int collision;
-    float open_ema; /* running baseline of the open-sky signal (prediction error) */
+    double coll_hold_s; /* bumper memory: contact-range window after a hit */
 
     /* downsampled float grids for the circuit (lam_w x lam_h x 3) */
     float *sample;
@@ -57,13 +57,8 @@ typedef struct {
     int64_t frames;
     int restored;
 
-    /* flight gait: spontaneous saccades + heading wander (xoshiro PRNG,
-     * seeded from the clock so no two runs are identical) */
+    /* seed noise only; ALL behavior comes from the circuit's own state */
     uint64_t rng;
-    float wander_bias;      /* OU heading bias, -1..1 */
-    float saccade_left;     /* seconds left in the current saccade (<0 = none) */
-    float saccade_dir;      /* -1 or +1 */
-    float saccade_cooldown; /* post-saccade holdoff */
     float last_turn_cmd;    /* for telemetry */
 
     /* thread-safety: the tick loop owns the circuit; API threads only touch
@@ -91,7 +86,7 @@ void fb_runtime_ingest_state(FbRuntime *rt, float altitude, float speed, float v
 void fb_runtime_set_learning(FbRuntime *rt, int on);
 void fb_runtime_wipe_memory(FbRuntime *rt);
 int fb_runtime_import_memory(FbRuntime *rt, const FbJson *mem);
-void fb_runtime_apply_reward(FbRuntime *rt, float r);
+void fb_runtime_apply_reward(FbRuntime *rt, float r); /* DAN excitability pathway */
 
 /* snapshots for the API layer (thread-safe; caller frees) */
 char *fb_runtime_telemetry_json(FbRuntime *rt);       /* malloc'd */

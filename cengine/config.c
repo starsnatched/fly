@@ -317,9 +317,11 @@ void fb_config_apply_profile_to_runtime(FbConfig *cfg, FbRuntime *rt,
         free(nm);
         /* fresh file that predates any pool config: back-fill from disk
          * (file read + import run under the held lock — the loop thread
-         * must not tick pools concurrently with the import) */
+         * must not tick pools concurrently with the import). Only a
+         * successful import sets pools_restored: a file that predates
+         * pools, or a transient read failure, must stay retryable on the
+         * next profile apply, or learned weights could never arrive. */
         if (!rt->pools_restored) fb_runtime_pools_restore_from_disk(rt);
-        rt->pools_restored = rt->pools_restored || rt->net->n_pools > 0;
     }
     fb_rt_unlock(rt);
 

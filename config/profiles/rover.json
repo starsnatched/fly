@@ -1,16 +1,21 @@
 {
   "readout": {
     "dnHzScale": 8.0,
+    "integrateMs": 90,
+    "learn": true,
+    "pools": [
+      { "group": "motor", "every": 7 },
+      { "group": "motor", "split": "lr", "which": 0 },
+      { "group": "motor", "split": "lr", "which": 1 }
+    ],
     "map": [
-      { "channel": "throttle", "signal": "motorDrive", "gain": 0.65, "offset": 0.24 },
-      { "channel": "throttle", "signal": "flowPitch",  "gain": 1.2, "shape": "tanh" },
-      { "channel": "steer",    "signal": "dnSteer",    "gain": 6.0, "shape": "tanh" },
-      { "channel": "steer",    "signal": "flowYaw",    "gain": 6.0, "shape": "tanh" }
+      { "channel": "throttle", "signal": "pool0", "gain": 5.0, "offset": -1.6 },
+      { "channel": "steer", "signal": "pool1-pool2", "gain": 40.0, "shape": "tanh" }
     ]
   },
   "actuators": {
     "channels": [
-      { "name": "throttle", "lo": 0.0, "hi": 1.0, "slewPerS": 4.0, "default": 0.62 },
+      { "name": "throttle", "lo": 0.0, "hi": 1.0, "slewPerS": 4.0, "default": 0.0 },
       { "name": "steer", "lo": -1.0, "hi": 1.0, "slewPerS": 10.0, "default": 0.0 }
     ]
   },
@@ -28,6 +33,7 @@
   },
   "reward": {
     "rewardGain": 0.3,
-    "rewardDecayPerS": 0.8
+    "shape": "relative",
+    "shapeTauS": 12.0
   }
 }

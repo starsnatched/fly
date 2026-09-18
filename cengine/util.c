@@ -68,6 +68,20 @@ int fb_remove_file(const char *path) {
     return 0;
 }
 
+int fb_copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return -1; }
+    char buf[65536];
+    size_t r;
+    while ((r = fread(buf, 1, sizeof(buf), in)) > 0)
+        fwrite(buf, 1, r, out);
+    int err = ferror(in) || ferror(out) || fclose(out) != 0;
+    fclose(in);
+    return err ? -1 : 0;
+}
+
 int fb_tcp_listen(int port) {
     int fd = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;

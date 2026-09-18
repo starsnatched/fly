@@ -241,14 +241,21 @@ static void handle_json_msg(FbApi *api, WsClient *c, char *text, size_t len) {
          * memory, and other clients' sockets are untouched. */
         const char *req_profile = fb_json_str(obj, "profile", "");
         if (req_profile[0]) {
+            /* "-pools" is legacy naming: the learned motor-pool decode IS
+             * the standard profile now, so old clients resolve unchanged */
+            char canon[64];
+            snprintf(canon, sizeof(canon), "%s", req_profile);
+            size_t cl = strlen(canon);
+            if (cl > 6 && strcmp(canon + cl - 6, "-pools") == 0)
+                canon[cl - 6] = '\0';
             char profile_path[512] = "";
-            if (strchr(req_profile, '/') || strchr(req_profile, '\\') ||
-                (strlen(req_profile) > 5 &&
-                 strcmp(req_profile + strlen(req_profile) - 5, ".json") == 0))
-                snprintf(profile_path, sizeof(profile_path), "%s", req_profile);
+            if (strchr(canon, '/') || strchr(canon, '\\') ||
+                (strlen(canon) > 5 &&
+                 strcmp(canon + strlen(canon) - 5, ".json") == 0))
+                snprintf(profile_path, sizeof(profile_path), "%s", canon);
             else
                 snprintf(profile_path, sizeof(profile_path),
-                         "config/profiles/%s.json", req_profile);
+                         "config/profiles/%s.json", canon);
             fb_runtime_switch_profile(api->rt, api->cfg, profile_path);
         }
         char *tel = fb_runtime_telemetry_json(api->rt);

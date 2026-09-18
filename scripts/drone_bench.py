@@ -395,7 +395,8 @@ async def amain(args):
     if args.fresh and BENCH_MEMORY.exists():
         BENCH_MEMORY.unlink()
 
-    profile = "drone-pools" if args.readout == "pools" else "drone"
+    # motor pools are the standard decode; --readout is kept for compat
+    profile = "drone"
     proc = subprocess.Popen(
         [str(SERVER), "--config", str(BENCH_CONFIG), "--profile", profile,
          "--port", str(WS_PORT)],

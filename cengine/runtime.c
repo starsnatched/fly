@@ -329,6 +329,17 @@ static void memory_save(FbRuntime *rt, int force) {
     fb_str_append_int(&s, rt->net->plastic_n);
     fb_str_append(&s, "}}");
 
+    /* one-generation safety net: keep the previous file as .bak before
+     * overwriting. Autosave fires from ANY boot — including bare ones with
+     * no learned memory loaded — so without this, a fresh run can silently
+     * overwrite the only copy of a learned lineage. */
+    FILE *prev = fopen(rt->cfg.memory_path, "rb");
+    if (prev) {
+        fclose(prev);
+        char bak[512];
+        snprintf(bak, sizeof(bak), "%s.bak", rt->cfg.memory_path);
+        fb_copy_file(rt->cfg.memory_path, bak);
+    }
     FILE *f = fopen(rt->cfg.memory_path, "wb");
     if (f) {
         fwrite(s.buf, 1, s.len, f);

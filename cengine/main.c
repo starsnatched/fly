@@ -18,13 +18,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
     }
     char profile_path[512] = "";
-    if (profile && profile[0]) {
-        if (strchr(profile, '/') || strchr(profile, '\\') ||
-            (strlen(profile) > 5 && strcmp(profile + strlen(profile) - 5, ".json") == 0))
-            snprintf(profile_path, sizeof(profile_path), "%s", profile); /* full path */
-        else
-            snprintf(profile_path, sizeof(profile_path), "config/profiles/%s.json", profile);
-    }
+    if (!profile || !profile[0]) profile = "drone"; /* default embodiment */
+    if (strchr(profile, '/') || strchr(profile, '\\') ||
+        (strlen(profile) > 5 && strcmp(profile + strlen(profile) - 5, ".json") == 0))
+        snprintf(profile_path, sizeof(profile_path), "%s", profile); /* full path */
+    else
+        snprintf(profile_path, sizeof(profile_path), "config/profiles/%s.json", profile);
 
     if (fb_net_init() != 0) {
         fprintf(stderr, "network init failed\n");

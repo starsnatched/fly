@@ -360,7 +360,8 @@ async def amain(args):
     if args.fresh and BENCH_MEMORY.exists():
         BENCH_MEMORY.unlink()
 
-    profile = "rover-pools" if args.readout == "pools" else "rover"
+    # motor pools are the standard decode; --readout is kept for compat
+    profile = "rover"
     proc = subprocess.Popen(
         [str(SERVER), "--config", str(BENCH_CONFIG), "--profile", profile,
          "--port", str(WS_PORT)],

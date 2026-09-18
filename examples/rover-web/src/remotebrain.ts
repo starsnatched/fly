@@ -66,7 +66,7 @@ export class RemoteBrain {
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
       // declare the embodiment so the brain drives THIS body (rover channels);
-      // ?profile=rover-pools opts into the direct motor-pool decode
+      // the learned motor-pool decode is the standard rover profile
       const wanted = new URLSearchParams(location.search).get("profile") || "rover";
       ws.send(JSON.stringify({ type: "hello", profile: wanted }));
       onReady?.();

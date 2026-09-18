@@ -32,6 +32,7 @@ void fb_sleep_ms(int ms);
  * sets *out_len. Returns NULL on failure. */
 uint8_t *fb_read_file(const char *path, size_t *out_len);
 int fb_remove_file(const char *path); /* 0 on success (or already gone) */
+int fb_copy_file(const char *src, const char *dst); /* 0 on success */
 
 /* one-time socket library init (WSAStartup on Windows); returns 0 on success */
 int fb_net_init(void);

@@ -78,11 +78,11 @@ Any machine with [zig](https://ziglang.org) (or `pip install ziglang` and use
 ```bash
 cd cengine && make            # builds ../build/flybrain-server
 make engine-test              # EMD steering self-test on the real connectome
-./../build/flybrain-server --config ../config/flybrain.json --profile drone
+./../build/flybrain-server --config ../config/flybrain.json   # drone profile is the default
 ```
 
 Flags: `--config <path>` (default `config/flybrain.json`), `--profile <name|path>`
-(a bare name resolves to `config/profiles/<name>.json`), `--port <ws>` (REST = ws+1,
+(a bare name resolves to `config/profiles/<name>.json`; default `drone`), `--port <ws>` (REST = ws+1,
 overriding the config's `network` block).
 
 Docker (no local toolchain needed):
@@ -147,15 +147,17 @@ dopamine error that gates R-STDP (`w += lr·dopa·(spike − tonic)`), with the
 same soft bounds and the same rule that a constant situation teaches
 nothing. The learned body map persists in the memory file (`"pools":[…]`)
 alongside the synapse multipliers, survives restarts, and is carried across
-live profile switches. `config/profiles/rover-pools.json` and
-`drone-pools.json` ship as working examples — both verified closed-loop
+live profile switches. `config/profiles/rover.json` and
+`drone.json` ARE the pool decode (the `-pools` naming was retired) — both
+verified closed-loop
 (`scripts/rover_bench.py`, `scripts/drone_bench.py`): the learned pool map
 flies the twin drone at 3.9 m/s with 1.71 hits/100 m vs 3.50 after wipe,
 and steers the rover via its motor L/R differential.
 
 Per embodiment (`config/profiles/`): the **drone** declares
-throttle/pitch/roll/yaw; the **rover** declares throttle/steer; the
-`-pools` variants drive their channels through direct motor pools. Gains in
+throttle/pitch/roll/yaw; the **rover** declares throttle/steer; both drive
+their channels through direct motor pools (population signals like `dnSteer`
+or `flowRoll` remain legal in the map for mixing). Gains in
 the map shape how strongly a signal drives a channel — they are anatomy
 annotations, not behavioral controllers: all behavior originates in the
 circuit (EMD flow, DN steering, R-STDP memory, pool plasticity) and its own

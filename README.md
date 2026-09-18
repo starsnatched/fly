@@ -39,9 +39,9 @@ cd examples/rover-web && npm i && npm run dev   # rover client on :5200
 
 Open a client and click launch. Each page declares its body in the opening
 `hello` (`{"profile":"rover"}`) and the running brain switches its
-actuator/readout anatomy to match — one brain, several bodies. Append
-`?profile=rover-pools` (or `drone-pools`) to run the direct motor-pool decode
-against the same brain, no restart needed.
+actuator/readout anatomy to match — one brain, several bodies. Both shipped
+profiles drive their channels through **direct motor pools**: the decode is
+learned, not configured (no restart needed to switch bodies).
 
 ## Talking to the brain
 
@@ -192,7 +192,7 @@ python scripts/extract_full_brain.py
 
 A body is a JSON overlay in `config/profiles/`. `drone.json`
 (throttle/pitch/roll/yaw) and `rover.json` (throttle/steer) ship as examples,
-plus `-pools` variants that drive channels through **direct motor pools** —
+and both drive channels through **direct motor pools** —
 individual connectome motor neurons whose plastic, dopamine-learned spike
 integrals ARE the raw channel signal. A hexapod, boat, or cursor is another
 JSON file:

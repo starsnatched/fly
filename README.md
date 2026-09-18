@@ -6,6 +6,8 @@ I respect your time so I decided to put this up front.
 
 I have measured 1.1GB of memory footprint for the C brain engine server. Running this on Intel Core Ultra 7 256V, I could reach 60hz motor output with less than 10ms of processing latency.
 
+I will test it on a physical embodiment with Raspberry Pi 5, processing the brain on the chip. I will update it here once I get meaningful results.
+
 Enjoy :)
 
 ---

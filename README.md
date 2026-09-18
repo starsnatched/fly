@@ -140,23 +140,30 @@ with learning on, an active circuit immediately keeps editing them, which is
 usually what you want.
 
 The server also autosaves to `memoryPath` (`config/flybrain.json`) and reloads
-it on boot, so a demo survives a restart on its own.
-
-## Downloading the full brain data
+it on boot, so a demo survives a restart on its own.## Downloading the full brain data
 
 The connectome binary is ~295 MB (`data/fly-brain-full.bin`, not in git).
-Three ways to get it:
+**`GET /brain` serves it from localhost because that is the one host that
+already has it** — it's how a running instance hands the exact binary it
+booted from to a client, container, or analysis script, with no out-of-band
+copying. It is not a distribution channel: a fresh machine has no brain to
+ask yet. For that:
 
-**1. From any running brain** — the server serves the binary it booted from:
+**Fresh clone — one command:**
 
 ```bash
-curl -o fly-brain-full.bin http://localhost:8788/brain
+python scripts/get_brain.py
 ```
 
-or with progress, or from Python:
+Hash-checks what's on disk, then pulls `fly-brain-full.bin` from this repo's
+GitHub Releases (set `GITHUB_TOKEN` if the repo is private), or any URL via
+`FLY_BRAIN_URL`. It verifies the SHA256 before installing and tells you how
+to rebuild from upstream if no release asset exists yet.
+
+**From any running brain** — the server serves the binary it booted from:
 
 ```bash
-curl -OJ http://localhost:8788/brain          # ~295 MB, application/octet-stream
+curl -OJ http://localhost:8788/brain            # ~295 MB, application/octet-stream
 ```
 
 ```python
@@ -169,17 +176,17 @@ CSR edge arrays) is documented in the docstring of
 `scripts/extract_full_brain.py`; `data/fly-brain-full.meta.json` holds the
 counts and the dataset/license metadata.
 
-**2. Rebuild from the raw connectome** — the extractor reads the MaleCNS
+**Rebuild from the raw connectome** — the extractor reads the MaleCNS
 exports in `data/` (`malecns-connectome.feather`, `malecns-annotations.feather`,
 `neuron-nt.json`, `tbar-nt.feather`) and regenerates the binary, including
-2-hop retinotopy inheritance so all 13,585 T4/T5 columns are located:
+2-hop retinotopy inheritance so all 13,585 T4/T5 columns are located. The raw
+exports are published by Janelia at
+[janelia.org/project-team/flyem/male-cns-connectome](https://www.janelia.org/project-team/flyem/male-cns-connectome)
+(CC-BY 4.0):
 
 ```bash
-.venv/Scripts/python scripts/extract_full_brain.py
+python scripts/extract_full_brain.py
 ```
-
-**3. Just use the repo's copy** — if `data/fly-brain-full.bin` is already on
-disk, the engine loads it at boot (`brain.binary` in `config/flybrain.json`).
 
 ## Bodies: one brain, any embodiment
 
@@ -231,7 +238,8 @@ data/                 fly-brain-full.bin (~295 MB connectome, not in git) +
                       rebuilds the binary from them
 examples/drone-web/   example embodiments (three.js): drone + rover clients —
 examples/rover-web/   the only TypeScript in the repo, talks only the API
-scripts/              connectome extractor, protocol test client, benchmarks
+scripts/              connectome extractor, bootstrap downloader (get_brain.py),
+                      protocol test client, benchmarks
 state/                learned weights (created at runtime, not in git)
 ```
 

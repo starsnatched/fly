@@ -1,5 +1,15 @@
 # FlyBrain — a fruit-fly brain as an API
 
+## Hardware requirements
+
+I respect your time so I decided to put this up front.
+
+I have measured 1.1GB of memory footprint for the C brain engine server. Running this on Intel Core Ultra 7 256V, I could reach 60hz motor output with less than 10ms of processing latency.
+
+Enjoy :)
+
+---
+
 The **entire traced MaleCNS v1.0 male fruit-fly CNS** (Janelia/Google, Cell
 2026 — CC-BY) — **165,122 spiking neurons wired by 25.5M real connectome
 synapses** — runs as a standalone C service. Any client that can send eye

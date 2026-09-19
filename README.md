@@ -55,6 +55,76 @@ actuator/readout anatomy to match — one brain, several bodies. Both shipped
 profiles drive their channels through **direct motor pools**: the decode is
 learned, not configured (no restart needed to switch bodies).
 
+## AirSim embodiment (physics-real drone)
+
+The browser drone flies a kinematic model. For a *physics-real* body — Unreal
+Engine aerodynamics, drag, collisions — the same brain also flies
+[AirSim](https://github.com/microsoft/AirSim) (v1.8.1 prebuilt binaries).
+
+```
+Unreal world ──center cam──▶ bridge ──eyes 0+1 + state──▶ connectome brain
+Unreal physics ◀──velocity sticks── bridge ◀──throttle/pitch/roll/yaw────┘
+```
+
+**One-time setup** (AirSim binaries are ~260 MB–1.7 GB, not in git):
+
+```bash
+python scripts/get_airsim.py            # Blocks (light, blocky obstacles)
+python scripts/get_airsim.py airsimnh   # realistic suburban neighborhood (1.7 GB)
+python scripts/get_airsim.py --list     # other environments
+```
+
+This also installs `config/airsim.settings.json` to `~/Documents/AirSim/settings.json`
+(use `--force-settings` to overwrite). The settings declare the Fly1 drone with
+SimpleFlight physics, collisions, and three 192×108 cameras (left/right ±35°
+and a forward center).
+
+**Every run:**
+
+```bash
+bash scripts/start_airsim_stack.sh          # brain + Blocks + bridge, skips what's up
+# or piecewise:
+./airsim/Blocks/WindowsNoEditor/Blocks.exe -opengl4 &   # simulator
+.venv/Scripts/python.exe scripts/airsim_drone.py        # bridge
+```
+
+**How it flies.** The bridge mirrors the browser embodiment's protocol
+(`hello profile=drone`, eye frames at `--vision-hz`, barometer/IMU state), but
+actuates FPV-joystick style via `moveByVelocityBodyFrameAsync` — SimpleFlight's
+flight controller does all prop mixing and attitude stabilization:
+
+| brain channel | stick | range |
+|---|---|---|
+| `pitch` | forward/backward body velocity | ±8 m/s |
+| `roll` | left/right body velocity | ±6 m/s |
+| `throttle` | climb/descent rate | ±3 m/s (hover = 0.29) |
+| `yaw` | yaw rate | ±90°/s |
+
+Vision defaults to the **forward center camera streamed to both eyes** (the
+retina's two hemispheres each read half the image); `--eyes stereo` switches to
+the ±35° left/right pair. The connectome decode has no altitude feedback by
+construction, so the bridge adds a gentle altitude-hold assist on the climb
+axis (`--no-assist` for raw sticks) plus a takeoff/recovery routine if the
+drone gets knocked to the ground.
+
+**Collision policy:** every collision sends a strong punishment pulse
+(default **−2.5**) to the brain and respawns the drone at the start point —
+*except* collisions with parked cars (`Car_*` in AirSimNH), which send a
+strong **+2.5 reward** (touching cars is the task). `--punish-mag` /
+`--reward-mag` tune the magnitudes. Each event names the object hit in the
+bridge log. `--reward alt` additionally enables classic reward shaping
+(altitude + forward progress) on top of the collision pulses.
+
+**Resetting learned memory:**
+
+```bash
+python scripts/reset_brain_memory.py           # wipe the live brain (hash-verified)
+python scripts/reset_brain_memory.py --full    # wipe + set aside the disk memory file
+```
+
+Useful flags: `--vision-hz 120` (web client's retina rate), `--altitude 6`
+(hold target), `--no-assist`, `--eyes stereo|center`, `--reward alt`.
+
 ## Talking to the brain
 
 Everything lives behind one WebSocket (`/stream`) plus a small REST surface.
@@ -251,6 +321,9 @@ data/                 fly-brain-full.bin (~295 MB connectome, not in git) +
 examples/drone-web/   example embodiments (three.js): drone + rover clients —
 examples/rover-web/   the only TypeScript in the repo, talks only the API
 scripts/              connectome extractor, bootstrap downloader (get_brain.py),
+                      AirSim installer (get_airsim.py) + AirSim bridge
+                      (airsim_drone.py, with vendored airsim client and a
+                      modern msgpack-RPC shim in scripts/msgpackrpc/),
                       protocol test client, benchmarks
 state/                learned weights (created at runtime, not in git)
 ```

@@ -227,6 +227,8 @@ data/
 # C engine build output + learned memory state
 build/
 state/
+# AirSim binaries, environments and logs (get via scripts/get_airsim.py)
+airsim/
 # browser example build/dev artifacts
 node_modules/
 examples/drone-web/node_modules/

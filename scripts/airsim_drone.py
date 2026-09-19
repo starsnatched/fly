@@ -23,10 +23,14 @@ AirSim side:
     controller does all prop mixing and attitude stabilization:
       pitch stick  -> forward/backward body-frame velocity
       roll stick   -> left/right body-frame velocity
-      throttle     -> climb/descent rate, stick NORMALIZED around hover so
-                      down authority == up authority (a raw mapping gives
-                      down-sticks only hover*100% of the up range, which is
-                      why the drone could climb but never descend)
+      throttle     -> SELECTS a target altitude lane (min_alt..max_alt);
+                      a P controller climbs/descends to hold it. Position
+                      control: the untrained throttle bias can no longer
+                      produce endless climbing — a wiggle changes the lane
+                      instead of integrating into continuous ascent, and
+                      ceiling punishment maps directly onto the throttle
+                      values that caused it. --control rate restores the
+                      old climb-rate stick.
       yaw stick    -> yaw RATE
       every stick is amplified (--stick-gain) then low-passed (--stick-tau)
       to behave like real RC sticks: the brain's brief wiggles become
@@ -41,6 +45,10 @@ AirSim side:
     --no-assist removes even that.
   - collisions punish (default -2.5) and respawn; parked-car touches reward
     (default +2.5) and respawn. --punish-mag / --reward-mag tune magnitudes.
+  - proximity shaping: every 0.5 s a small reward pulse proportional to
+    closeness to the nearest parked car (3D distance; 0 beyond --prox-radius,
+    --prox-max at contact). The brain's relative reward shaping turns this
+    into "closing in on cars is good, retreating is bad". --prox-gain 0 off.
 
 Usage:
   python scripts/airsim_drone.py                     # defaults, assist on
@@ -77,6 +85,7 @@ DEFAULT_VISION_HZ = 60          # --vision-hz 120 matches the web client
 V_FWD_MAX = 12.0       # m/s at |pitch stick| = 1 (web convention: -pitch = fwd)
 V_LAT_MAX = 9.0        # m/s at |roll stick| = 1 — strong avoidance authority
 VZ_MAX = 7.0           # m/s climb/descent demand at |climb stick| = 1
+ALT_P_GAIN = 0.9       # lane-mode altitude controller (m/s per m of error)
 YAW_RATE_MAX = 200.0   # deg/s at |yaw stick| = 1 — drastic turns
 STICK_GAIN = 2.0       # sensitivity: amplify the brain's small channel wiggles
 STICK_TAU_S = 0.15     # RC stick inertia (first-order low-pass on each stick)
@@ -146,6 +155,13 @@ class Bridge:
         self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
         self._stick_at = 0.0
         self._hud = (0.0, 0.0, 0.0, 0.0)
+        self.lane = (self.args.min_alt
+                     + BRAIN_HOVER * (self.args.max_alt - self.args.min_alt))
+        self._lane_at = 0.0
+        self.car_poses: list[tuple[float, float, float]] = []
+        self._near_car = float("inf")
+        self._prox_val = 0.0
+        self._last_prox_t = 0.0
 
     # ---- brain link ------------------------------------------------------
     async def run(self) -> int:
@@ -159,6 +175,7 @@ class Bridge:
             return 1
         self.spawn = client.simGetGroundTruthKinematics(args.vehicle).position
         self.setup_vehicle(client)
+        self.cache_car_poses(client)
 
         delay = RETRY_BASE_S
         while True:
@@ -177,6 +194,22 @@ class Bridge:
                 print(f"[bridge] error: {exc!r}; retrying", flush=True)
             await asyncio.sleep(delay)
             delay = min(RETRY_MAX_S, delay * 1.5)
+
+    def cache_car_poses(self, client) -> None:
+        """World poses of the parked Car_* meshes (static scenery in
+        AirSimNH). Fetched once at startup; the per-tick nearest-car distance
+        is then pure math, no RPC. Powers the proximity reward shaping."""
+        try:
+            names = [n for n in client.simListSceneObjects("[Cc]ar.*")
+                     if CAR_NAME_RE.match(n)]
+            for name in names:
+                p = client.simGetObjectPose(name).position
+                self.car_poses.append((p.x_val, p.y_val, p.z_val))
+        except Exception as exc:
+            print(f"[airsim] car pose cache failed ({exc!r}); "
+                  f"proximity reward disabled", flush=True)
+        print(f"[airsim] tracking {len(self.car_poses)} parked cars "
+              f"for proximity reward", flush=True)
 
     def setup_vehicle(self, client) -> None:
         client.enableApiControl(True, self.args.vehicle)
@@ -251,6 +284,29 @@ class Bridge:
             self.respawn(client)
             self._last_respawn = now
 
+    async def proximity_reward(self, ws, kin, now: float) -> None:
+        """Continuous shaping stream: a small reward pulse every 0.5 s,
+        proportional to closeness of the nearest parked car (3D distance).
+        The brain's relative shaping (tau 12 s) adapts to any steady value,
+        so what actually gets reinforced is the GRADIENT: closing in on a
+        car drives dopamine up, drifting away drives it down — a guidance
+        signal toward the +2.5 car-touch event, without drowning it."""
+        if self.args.prox_gain <= 0.0 or not self.car_poses:
+            self._prox_val = 0.0
+            return
+        if now - self._last_prox_t < 0.5:
+            return
+        self._last_prox_t = now
+        p = kin.position
+        d2 = min((p.x_val - x) ** 2 + (p.y_val - y) ** 2 + (p.z_val - z) ** 2
+                 for x, y, z in self.car_poses)
+        self._near_car = math.sqrt(d2)
+        v = (self.args.prox_gain * self.args.prox_max
+             * clamp(1.0 - self._near_car / self.args.prox_radius, 0.0, 1.0))
+        self._prox_val = v
+        if v > 0.0:
+            await ws.send(json.dumps({"type": "reward", "value": round(v, 3)}))
+
     async def handshake(self, ws) -> None:
         await ws.send(json.dumps({"type": "hello", "profile": "drone"}))
         ack = json.loads(await ws.recv())
@@ -282,6 +338,7 @@ class Bridge:
                 kin = client.simGetGroundTruthKinematics(self.args.vehicle)
                 self.recover_if_stuck(client, kin, now)
                 self.check_bounds(client, kin, now)
+                await self.proximity_reward(ws, kin, now)
                 await self.maybe_reward(client, ws, now)
                 if now - self._last_tel_req > 1.0:
                     self._last_tel_req = now
@@ -401,6 +458,8 @@ class Bridge:
         self.cmd = {"throttle": BRAIN_HOVER, "pitch": 0.0, "roll": 0.0, "yaw": 0.0}
         self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
         self._ceil_since = 0.0
+        self.lane = (self.args.min_alt
+                     + BRAIN_HOVER * (self.args.max_alt - self.args.min_alt))
         client.moveByVelocityBodyFrameAsync(
             0.0, 0.0, -1.5, 1.0,
             airsim.DrivetrainType.MaxDegreeOfFreedom,
@@ -441,27 +500,49 @@ class Bridge:
         return self.stick
 
     def apply_command(self, client, now: float) -> None:
-        """FPV joystick scheme: smoothed RC sticks demand body-frame
-        velocities + yaw rate; SimpleFlight mixes props and stabilizes."""
+        """FPV joystick scheme. fwd/lat/yaw are amplified, low-passed rate
+        sticks; altitude depends on --control:
+          lane (default) — the throttle channel SELECTS a target altitude
+              lane and a P controller flies there (position control: an
+              untrained climb bias holds a high lane instead of ascending
+              forever, and ceiling punishes map onto the throttle values
+              that chose them — clean credit assignment for R-STDP).
+          rate — the old normalized climb-rate stick (needs --no-assist
+              to be fully raw)."""
         if now - self._last_cmd_at < self.CMD_PERIOD_S:
             return
         self._last_cmd_at = now
         s = self.compute_sticks(now)
-        climb = s["climb"]
-        if not self.args.no_assist:
-            # brain owns altitude; the band blends demand toward a safe rate
-            # within 1 m of an edge and FULLY overrides past it, so even a
-            # saturated climb/descent stick cannot fly out of the band
+        if self.args.control == "lane" and not self.args.no_assist:
             kin = client.simGetGroundTruthKinematics(self.args.vehicle)
             alt = -kin.position.z_val
-            over = (self.args.min_alt + 1.0) - alt
-            if over > 0.0:                      # floor: blend to +2 m/s climb
-                f = clamp(over, 0.0, 1.0)
-                climb = climb * (1.0 - f) + 2.0 * f
-            over = alt - (self.args.max_alt - 1.0)
-            if over > 0.0:                      # ceiling: blend to -0.8 m/s
-                f = clamp(over, 0.0, 1.0)
-                climb = climb * (1.0 - f) - 0.8 * f
+            # the selected lane glides RC-style, then the controller chases it
+            lane_t = (self.args.min_alt
+                      + clamp(self.cmd["throttle"], 0.0, 1.0)
+                      * (self.args.max_alt - self.args.min_alt))
+            dt = clamp(now - self._lane_at, 0.001, 0.2) if self._lane_at else 0.05
+            self._lane_at = now
+            a = (1.0 if self.args.stick_tau <= 0
+                 else min(1.0, dt / self.args.stick_tau))
+            self.lane += (lane_t - self.lane) * a
+            climb = clamp(ALT_P_GAIN * (self.lane - alt), -VZ_MAX, VZ_MAX)
+            if alt < 0.8:                       # never burrow into the ground
+                climb = max(climb, 2.0)
+        else:
+            climb = s["climb"]
+            if not self.args.no_assist:
+                # brain owns altitude; the band blends demand toward a safe
+                # rate within 1 m of an edge and FULLY overrides past it
+                kin = client.simGetGroundTruthKinematics(self.args.vehicle)
+                alt = -kin.position.z_val
+                over = (self.args.min_alt + 1.0) - alt
+                if over > 0.0:                  # floor: blend to +2 m/s climb
+                    f = clamp(over, 0.0, 1.0)
+                    climb = climb * (1.0 - f) + 2.0 * f
+                over = alt - (self.args.max_alt - 1.0)
+                if over > 0.0:                  # ceiling: blend to -0.8 m/s
+                    f = clamp(over, 0.0, 1.0)
+                    climb = climb * (1.0 - f) - 0.8 * f
         self._hud = (s["fwd"], s["lat"], s["climb"], s["yaw"])
         # NED: vz is down-positive, so pass -climb
         client.moveByVelocityBodyFrameAsync(
@@ -522,10 +603,12 @@ class Bridge:
         sim_ms = tel.get("simMs", 0.0)
         stale = time.perf_counter() - self._actions_at
         sticks = self._hud
-        print(f"[fly] alt {alt:5.1f} m  spd {speed:4.1f} m/s  "
+        print(f"[fly] alt {alt:5.1f} m  lane {self.lane:5.1f} m  "
+              f"spd {speed:4.1f} m/s  "
               f"sticks fwd {sticks[0]:+5.1f} lat {sticks[1]:+5.1f} "
-              f"up {sticks[2]:+5.1f} m/s yaw {sticks[3]:+6.1f} deg/s  "
+              f"vz {sticks[2]:+5.1f} m/s yaw {sticks[3]:+6.1f} deg/s  "
               f"hits {self.collision_count}  cars {self.car_bumps}  "
+              f"near {self._near_car:5.1f} m  prox {self._prox_val:+.2f}  "
               f"dopa {self.dopa:+.3f} "
               f"learn {'on' if self.learning else 'off'}  "
               f"sim {sim_ms:.1f} ms  act {stale*1000:.0f} ms ago", flush=True)
@@ -550,12 +633,21 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="sensitivity multiplier on every stick (pre-clamp)")
     ap.add_argument("--stick-tau", type=float, default=STICK_TAU_S,
                     help="RC stick inertia time constant (s); 0 = raw sticks")
+    ap.add_argument("--control", choices=["lane", "rate"], default="lane",
+                    help="lane: throttle selects a target altitude (position "
+                         "control); rate: climb-rate stick (legacy)")
     ap.add_argument("--ceil-ride", type=float, default=CEILING_RIDE_S,
                     help="seconds riding the ceiling before punish+respawn")
     ap.add_argument("--border-radius", type=float, default=BORDER_RADIUS_M,
                     help="horizontal leash from spawn; beyond it = map border")
     ap.add_argument("--ground-z", type=float, default=GROUND_Z,
                     help="world-frame z of the ground plane at the spawn area")
+    ap.add_argument("--prox-gain", type=float, default=1.0,
+                    help="proximity-reward gain (0 disables the shaping)")
+    ap.add_argument("--prox-radius", type=float, default=40.0,
+                    help="nearest-car distance beyond which prox reward is 0 (m)")
+    ap.add_argument("--prox-max", type=float, default=0.5,
+                    help="proximity reward pulse value at 0 m distance")
     ap.add_argument("--no-assist", action="store_true",
                     help="apply raw brain channels, no altitude hold")
     ap.add_argument("--punish-mag", type=float, default=-2.5,

@@ -97,14 +97,19 @@ flight controller does all prop mixing and attitude stabilization:
 |---|---|---|
 | `pitch` | forward/backward body velocity | ±12 m/s |
 | `roll` | left/right body velocity | ±9 m/s |
-| `throttle` | climb/descent rate, normalized around hover | ±7 m/s both ways |
+| `throttle` | **altitude lane selector** (position control) | 2.5–30 m lane |
 | `yaw` | yaw rate | ±200°/s |
 
 Sticks get real FPV feel: `--stick-gain` (default 2.0) amplifies the brain's
 small channel wiggles into full deflections, and `--stick-tau` (default 0.15 s)
 gives each stick RC-style inertia so sustained channel output integrates into
-motion. The throttle stick is normalized around hover (0.29), so down
-authority equals up authority.
+motion. Altitude is **position control** (`--control lane`, default): the
+throttle channel selects a target altitude lane between `--min-alt` and
+`--max-alt` and a P controller flies there. A rate-mode climb stick
+(`--control rate`) is available, but the untrained throttle bias kept it
+pushing skyward — under lane control "climb bias" just means holding a
+higher lane, and ceiling punishments map onto the throttle values that chose
+them (clean credit assignment for R-STDP).
 
 Vision defaults to the **forward center camera streamed to both eyes** (the
 retina's two hemispheres each read half the image); `--eyes stereo` switches to
@@ -123,6 +128,15 @@ object hit (or `ceiling` / `map border`) in the bridge log. `--reward alt`
 additionally enables classic reward shaping (altitude + forward progress) on
 top of the event pulses.
 
+**Proximity reward:** every 0.5 s the bridge also streams a small shaping
+pulse proportional to closeness of the nearest parked car (3D distance,
+linear to 0 beyond `--prox-radius` 40 m, `--prox-max` 0.5 at contact). The
+brain's relative reward shaping (τ = 12 s) adapts to any steady value, so
+this reinforces the *gradient*: closing in on a car is good, drifting away
+is bad — a guidance signal toward the +2.5 car touch, without drowning it.
+The HUD line shows `near <d> m` and `prox <+v>` live; `--prox-gain 0`
+disables it. The 70 parked-car poses are cached once at startup.
+
 **Resetting learned memory:**
 
 ```bash
@@ -131,8 +145,9 @@ python scripts/reset_brain_memory.py --full    # wipe + set aside the disk memor
 ```
 
 Useful flags: `--vision-hz 120` (web client's retina rate), `--min-alt 2.5`
-/ `--max-alt 30` (safety band), `--stick-gain 2.0` / `--stick-tau 0.15`
-(FPV stick feel), `--ceil-ride 2` / `--border-radius 450` (bounds policy),
+/ `--max-alt 30` (safety band), `--control lane|rate` (altitude scheme),
+`--stick-gain 2.0` / `--stick-tau 0.15` (FPV stick feel),
+`--ceil-ride 2` / `--border-radius 450` (bounds policy),
 `--no-assist`, `--eyes stereo|center`, `--reward alt`.
 
 ## Talking to the brain

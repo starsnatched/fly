@@ -95,25 +95,33 @@ flight controller does all prop mixing and attitude stabilization:
 
 | brain channel | stick | range |
 |---|---|---|
-| `pitch` | forward/backward body velocity | ±8 m/s |
-| `roll` | left/right body velocity | ±6 m/s |
-| `throttle` | climb/descent rate | ±3 m/s (hover = 0.29) |
-| `yaw` | yaw rate | ±90°/s |
+| `pitch` | forward/backward body velocity | ±12 m/s |
+| `roll` | left/right body velocity | ±9 m/s |
+| `throttle` | climb/descent rate, normalized around hover | ±7 m/s both ways |
+| `yaw` | yaw rate | ±200°/s |
+
+Sticks get real FPV feel: `--stick-gain` (default 2.0) amplifies the brain's
+small channel wiggles into full deflections, and `--stick-tau` (default 0.15 s)
+gives each stick RC-style inertia so sustained channel output integrates into
+motion. The throttle stick is normalized around hover (0.29), so down
+authority equals up authority.
 
 Vision defaults to the **forward center camera streamed to both eyes** (the
 retina's two hemispheres each read half the image); `--eyes stereo` switches to
-the ±35° left/right pair. The connectome decode has no altitude feedback by
-construction, so the bridge adds a gentle altitude-hold assist on the climb
-axis (`--no-assist` for raw sticks) plus a takeoff/recovery routine if the
-drone gets knocked to the ground.
+the ±35° left/right pair. The brain's throttle fully owns altitude; a safety
+band only pushes back within ~1 m of `--min-alt` (2.5 m) / `--max-alt` (30 m).
+A takeoff/recovery routine lifts the drone if it gets knocked to the ground.
 
 **Collision policy:** every collision sends a strong punishment pulse
 (default **−2.5**) to the brain and respawns the drone at the start point —
 *except* collisions with parked cars (`Car_*` in AirSimNH), which send a
-strong **+2.5 reward** (touching cars is the task). `--punish-mag` /
-`--reward-mag` tune the magnitudes. Each event names the object hit in the
-bridge log. `--reward alt` additionally enables classic reward shaping
-(altitude + forward progress) on top of the collision pulses.
+strong **+2.5 reward** (touching cars is the task). Riding the ceiling
+(`--max-alt`) for more than `--ceil-ride` seconds (2 s) or leaving the spawn
+leash (`--border-radius`, 450 m) punishes and respawns the same way.
+`--punish-mag` / `--reward-mag` tune the magnitudes. Each event names the
+object hit (or `ceiling` / `map border`) in the bridge log. `--reward alt`
+additionally enables classic reward shaping (altitude + forward progress) on
+top of the event pulses.
 
 **Resetting learned memory:**
 
@@ -122,8 +130,10 @@ python scripts/reset_brain_memory.py           # wipe the live brain (hash-verif
 python scripts/reset_brain_memory.py --full    # wipe + set aside the disk memory file
 ```
 
-Useful flags: `--vision-hz 120` (web client's retina rate), `--altitude 6`
-(hold target), `--no-assist`, `--eyes stereo|center`, `--reward alt`.
+Useful flags: `--vision-hz 120` (web client's retina rate), `--min-alt 2.5`
+/ `--max-alt 30` (safety band), `--stick-gain 2.0` / `--stick-tau 0.15`
+(FPV stick feel), `--ceil-ride 2` / `--border-radius 450` (bounds policy),
+`--no-assist`, `--eyes stereo|center`, `--reward alt`.
 
 ## Talking to the brain
 

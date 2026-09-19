@@ -23,8 +23,14 @@ AirSim side:
     controller does all prop mixing and attitude stabilization:
       pitch stick  -> forward/backward body-frame velocity
       roll stick   -> left/right body-frame velocity
-      throttle     -> climb/descent rate (around hover)
+      throttle     -> climb/descent rate, stick NORMALIZED around hover so
+                      down authority == up authority (a raw mapping gives
+                      down-sticks only hover*100% of the up range, which is
+                      why the drone could climb but never descend)
       yaw stick    -> yaw RATE
+      every stick is amplified (--stick-gain) then low-passed (--stick-tau)
+      to behave like real RC sticks: the brain's brief wiggles become
+      gliding deflections and sustained outputs integrate into motion
   - vision: ONE forward-facing center camera (camera "2"); its frame is
     streamed to BOTH eyes (0 and 1) so the connectome's full bilateral
     retina sees the same view. --eyes stereo restores the +-35 deg pair.
@@ -70,15 +76,20 @@ DEFAULT_VISION_HZ = 60          # --vision-hz 120 matches the web client
 # ---- AirSim joystick envelope (SimpleFlight) -------------------------------
 V_FWD_MAX = 12.0       # m/s at |pitch stick| = 1 (web convention: -pitch = fwd)
 V_LAT_MAX = 9.0        # m/s at |roll stick| = 1 — strong avoidance authority
-VZ_MAX = 6.0           # m/s climb/descent clamp — drastic altitude changes
-VZ_GAIN = 10.0         # m/s climb per unit throttle above BRAIN_HOVER
+VZ_MAX = 7.0           # m/s climb/descent demand at |climb stick| = 1
 YAW_RATE_MAX = 200.0   # deg/s at |yaw stick| = 1 — drastic turns
+STICK_GAIN = 2.0       # sensitivity: amplify the brain's small channel wiggles
+STICK_TAU_S = 0.15     # RC stick inertia (first-order low-pass on each stick)
 CMD_HOLD_S = 0.25      # velocity command hold (re-sent every CMD_PERIOD_S)
 
 BRAIN_HOVER = 0.29                     # brain throttle default (drone.json)
 
 RESPAWN_ALT = 8.0      # respawn height above ground (m)
+GROUND_Z = 0.0         # world-frame z of the ground plane (--ground-z)
 RESPAWN_COOLDOWN_S = 2.5   # ignore collisions this long after a respawn
+
+CEILING_RIDE_S = 2.0    # pinned at/above the ceiling this long -> punish
+BORDER_RADIUS_M = 450.0 # horizontal leash from the spawn point (map border)
 
 RETRY_BASE_S = 1.0
 RETRY_MAX_S = 8.0
@@ -118,6 +129,9 @@ class Bridge:
         self.learning = False
         self.collision_count = 0
         self.car_bumps = 0
+        self.ceiling_hits = 0
+        self.border_hits = 0
+        self._ceil_since = 0.0
         self._last_col_ts = 0.0
         self._last_respawn = 0.0
         self._reward_prog = 0.0
@@ -129,6 +143,9 @@ class Bridge:
         self._last_cmd_at = 0.0
         self._grounded_since = 0.0
         self._ws_ref = None
+        self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
+        self._stick_at = 0.0
+        self._hud = (0.0, 0.0, 0.0, 0.0)
 
     # ---- brain link ------------------------------------------------------
     async def run(self) -> int:
@@ -168,10 +185,12 @@ class Bridge:
 
     def takeoff(self, client) -> None:
         """Un-stick (spawn can be below the collision surface, which pins the
-        physics resolver), teleport airborne, then climb to a clean start."""
+        physics resolver), teleport to a clean absolute altitude, then climb
+        a little. Absolute z (ground-z - 8) instead of relative, so a spawn
+        captured mid-air can never push the drone above the ceiling."""
         print("[airsim] takeoff", flush=True)
         pose = client.simGetVehiclePose(self.args.vehicle)
-        pose.position.z_val -= 8.0   # NED: negative z is up
+        pose.position.z_val = self.args.ground_z - RESPAWN_ALT  # NED: up = -z
         client.simSetVehiclePose(pose, True, self.args.vehicle)
         client.moveByVelocityBodyFrameAsync(
             0.0, 0.0, -2.0, 4.0,   # climb at 2 m/s for 4 s (NED: -vz = up)
@@ -180,10 +199,9 @@ class Bridge:
             self.args.vehicle,
         ).join()
 
-    def recover_if_stuck(self, client, now: float) -> None:
+    def recover_if_stuck(self, client, kin, now: float) -> None:
         """Grounded recovery: if we sit at/below ground with no motion for a
         while (wedged, or knocked down), teleport up and take off again."""
-        kin = client.simGetGroundTruthKinematics(self.args.vehicle)
         alt = -kin.position.z_val
         speed = math.sqrt(kin.linear_velocity.x_val ** 2
                           + kin.linear_velocity.y_val ** 2
@@ -197,6 +215,41 @@ class Bridge:
                 self._grounded_since = 0.0
         else:
             self._grounded_since = 0.0
+
+    def check_bounds(self, client, kin, now: float) -> None:
+        """Ceiling and map-border policy: riding the ceiling or leaving the
+        spawn leash is a punish + respawn, exactly like a collision."""
+        if now - self._last_respawn < RESPAWN_COOLDOWN_S:
+            return
+        alt = -kin.position.z_val
+        dx = kin.position.x_val - self.spawn.x_val
+        dy = kin.position.y_val - self.spawn.y_val
+        dist = math.hypot(dx, dy)
+        reason = None
+        # ceiling punish sits 25 cm inside the blended band edge, so a
+        # saturated climb that equilibrates right at the ceiling still counts
+        if alt >= self.args.max_alt - 0.25:
+            if self._ceil_since == 0.0:
+                self._ceil_since = now
+            elif now - self._ceil_since > self.args.ceil_ride:
+                reason = "ceiling"
+        else:
+            self._ceil_since = 0.0
+        if reason is None and dist > self.args.border_radius:
+            reason = "map border"
+        if reason is not None:
+            if reason == "ceiling":
+                self.ceiling_hits += 1
+            else:
+                self.border_hits += 1
+            asyncio.get_running_loop().create_task(
+                self.send_reward_now(self.args.punish_mag))
+            print(f"[sim] {reason} -> punish {self.args.punish_mag:+.1f}; "
+                  f"respawning (hits {self.collision_count}, ceilings "
+                  f"{self.ceiling_hits}, borders {self.border_hits})",
+                  flush=True)
+            self.respawn(client)
+            self._last_respawn = now
 
     async def handshake(self, ws) -> None:
         await ws.send(json.dumps({"type": "hello", "profile": "drone"}))
@@ -226,7 +279,9 @@ class Bridge:
 
                 # periodic control / telemetry / status
                 self.apply_command(client, now)
-                self.recover_if_stuck(client, now)
+                kin = client.simGetGroundTruthKinematics(self.args.vehicle)
+                self.recover_if_stuck(client, kin, now)
+                self.check_bounds(client, kin, now)
                 await self.maybe_reward(client, ws, now)
                 if now - self._last_tel_req > 1.0:
                     self._last_tel_req = now
@@ -332,16 +387,20 @@ class Bridge:
         self._last_respawn = now
 
     def respawn(self, client) -> None:
-        """Back to the spawn pose facing down the street, clean altitude."""
+        """Back to the spawn XY facing down the street, at an ABSOLUTE
+        respawn altitude above the ground plane (never relative to wherever
+        the drone was when the bridge started)."""
         pose = client.simGetVehiclePose(self.args.vehicle)
         sp = self.spawn
         pose.position.x_val = sp.x_val
         pose.position.y_val = sp.y_val
-        pose.position.z_val = sp.z_val - RESPAWN_ALT   # NED: up = negative
+        pose.position.z_val = self.args.ground_z - RESPAWN_ALT  # NED: up = -z
         pose.orientation = airsim.Quaternionr(0.0, 0.0, 0.0, 1.0)  # level, initial heading
         client.simSetVehiclePose(pose, True, self.args.vehicle)
         # kill any stale brain stick bias so the fresh episode starts calm
         self.cmd = {"throttle": BRAIN_HOVER, "pitch": 0.0, "roll": 0.0, "yaw": 0.0}
+        self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
+        self._ceil_since = 0.0
         client.moveByVelocityBodyFrameAsync(
             0.0, 0.0, -1.5, 1.0,
             airsim.DrivetrainType.MaxDegreeOfFreedom,
@@ -352,38 +411,63 @@ class Bridge:
     # ---- act -------------------------------------------------------------
     CMD_PERIOD_S = 0.05  # 20 Hz command refresh (SimpleFlight holds the rest)
 
+    def compute_sticks(self, now: float) -> dict[str, float]:
+        """Brain channels -> RC sticks, with real FPV feel:
+        - the throttle stick is NORMALIZED around BRAIN_HOVER: hover-scaled
+          down deflections get the same authority as up deflections (the old
+          raw mapping capped down-sticks at hover of the up range, so the
+          drone could climb but never genuinely descend);
+        - --stick-gain amplifies the brain's small channel wiggles;
+        - a first-order low-pass (--stick-tau) gives the stick real inertia,
+          so brief channel dips integrate into actual stick deflections the
+          flight controller can act on, instead of being averaged away."""
+        c = self.cmd
+        gain = self.args.stick_gain
+        d = clamp(c["throttle"], 0.0, 1.0) - BRAIN_HOVER
+        t = d / (1.0 - BRAIN_HOVER) if d >= 0.0 else d / BRAIN_HOVER
+        raw = {
+            "fwd":   clamp(-c["pitch"] * gain, -1.0, 1.0) * V_FWD_MAX,
+            "lat":   clamp(c["roll"] * gain, -1.0, 1.0) * V_LAT_MAX,
+            "climb": clamp(t * gain, -1.0, 1.0) * VZ_MAX,
+            "yaw":   -clamp(c["yaw"] * gain, -1.0, 1.0) * YAW_RATE_MAX,
+        }
+        dt = now - self._stick_at
+        self._stick_at = now
+        if dt <= 0.0:
+            return self.stick
+        a = 1.0 if self.args.stick_tau <= 0 else min(1.0, dt / self.args.stick_tau)
+        for k, tgt in raw.items():
+            self.stick[k] += (tgt - self.stick[k]) * a
+        return self.stick
+
     def apply_command(self, client, now: float) -> None:
-        """FPV joystick scheme: the brain's channels drive body-frame velocity
-        sticks + yaw rate; SimpleFlight's flight controller handles prop
-        mixing, attitude and stabilization."""
+        """FPV joystick scheme: smoothed RC sticks demand body-frame
+        velocities + yaw rate; SimpleFlight mixes props and stabilizes."""
         if now - self._last_cmd_at < self.CMD_PERIOD_S:
             return
         self._last_cmd_at = now
-        c = self.cmd
-
-        fwd = clamp(-c["pitch"], -1.0, 1.0) * V_FWD_MAX   # -pitch = forward
-        lat = clamp(c["roll"], -1.0, 1.0) * V_LAT_MAX     # + = right
-        yaw_rate = -clamp(c["yaw"], -1.0, 1.0) * YAW_RATE_MAX  # NED sign
-        stick_climb = (c["throttle"] - BRAIN_HOVER) * VZ_GAIN
-
-        if self.args.no_assist:
-            climb = clamp(stick_climb, -VZ_MAX, VZ_MAX)
-        else:
-            # brain owns altitude; safety band only engages at the edges
+        s = self.compute_sticks(now)
+        climb = s["climb"]
+        if not self.args.no_assist:
+            # brain owns altitude; the band blends demand toward a safe rate
+            # within 1 m of an edge and FULLY overrides past it, so even a
+            # saturated climb/descent stick cannot fly out of the band
             kin = client.simGetGroundTruthKinematics(self.args.vehicle)
             alt = -kin.position.z_val
-            climb = stick_climb
-            if alt < self.args.min_alt:
-                climb += min(3.0, 0.8 * (self.args.min_alt - alt))
-            elif alt > self.args.max_alt:
-                climb -= min(3.0, 0.8 * (alt - self.args.max_alt))
-            climb = clamp(climb, -VZ_MAX, VZ_MAX)
-
+            over = (self.args.min_alt + 1.0) - alt
+            if over > 0.0:                      # floor: blend to +2 m/s climb
+                f = clamp(over, 0.0, 1.0)
+                climb = climb * (1.0 - f) + 2.0 * f
+            over = alt - (self.args.max_alt - 1.0)
+            if over > 0.0:                      # ceiling: blend to -0.8 m/s
+                f = clamp(over, 0.0, 1.0)
+                climb = climb * (1.0 - f) - 0.8 * f
+        self._hud = (s["fwd"], s["lat"], s["climb"], s["yaw"])
         # NED: vz is down-positive, so pass -climb
         client.moveByVelocityBodyFrameAsync(
-            fwd, lat, -climb, CMD_HOLD_S + self.CMD_PERIOD_S,
+            s["fwd"], s["lat"], -climb, CMD_HOLD_S + self.CMD_PERIOD_S,
             airsim.DrivetrainType.MaxDegreeOfFreedom,
-            airsim.YawMode(True, yaw_rate),
+            airsim.YawMode(True, s["yaw"]),
             self.args.vehicle,
         )
 
@@ -437,7 +521,7 @@ class Bridge:
         tel = self.telemetry or {}
         sim_ms = tel.get("simMs", 0.0)
         stale = time.perf_counter() - self._actions_at
-        sticks = self.joystick_sticks()
+        sticks = self._hud
         print(f"[fly] alt {alt:5.1f} m  spd {speed:4.1f} m/s  "
               f"sticks fwd {sticks[0]:+5.1f} lat {sticks[1]:+5.1f} "
               f"up {sticks[2]:+5.1f} m/s yaw {sticks[3]:+6.1f} deg/s  "
@@ -445,14 +529,6 @@ class Bridge:
               f"dopa {self.dopa:+.3f} "
               f"learn {'on' if self.learning else 'off'}  "
               f"sim {sim_ms:.1f} ms  act {stale*1000:.0f} ms ago", flush=True)
-
-    def joystick_sticks(self) -> tuple[float, float, float, float]:
-        """The joystick values currently being applied (for the HUD line)."""
-        c = self.cmd
-        return (clamp(-c["pitch"], -1.0, 1.0) * V_FWD_MAX,
-                clamp(c["roll"], -1.0, 1.0) * V_LAT_MAX,
-                clamp((c["throttle"] - BRAIN_HOVER) * VZ_GAIN, -VZ_MAX, VZ_MAX),
-                -clamp(c["yaw"], -1.0, 1.0) * YAW_RATE_MAX)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -466,10 +542,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--eyes", choices=["center", "stereo"], default="center",
                     help="center: one forward camera to both eyes; "
                          "stereo: +-35 deg left/right pair")
-    ap.add_argument("--min-alt", type=float, default=3.0,
+    ap.add_argument("--min-alt", type=float, default=2.5,
                     help="ground safety band lower edge (m)")
-    ap.add_argument("--max-alt", type=float, default=24.0,
+    ap.add_argument("--max-alt", type=float, default=30.0,
                     help="ceiling safety band upper edge (m)")
+    ap.add_argument("--stick-gain", type=float, default=STICK_GAIN,
+                    help="sensitivity multiplier on every stick (pre-clamp)")
+    ap.add_argument("--stick-tau", type=float, default=STICK_TAU_S,
+                    help="RC stick inertia time constant (s); 0 = raw sticks")
+    ap.add_argument("--ceil-ride", type=float, default=CEILING_RIDE_S,
+                    help="seconds riding the ceiling before punish+respawn")
+    ap.add_argument("--border-radius", type=float, default=BORDER_RADIUS_M,
+                    help="horizontal leash from spawn; beyond it = map border")
+    ap.add_argument("--ground-z", type=float, default=GROUND_Z,
+                    help="world-frame z of the ground plane at the spawn area")
     ap.add_argument("--no-assist", action="store_true",
                     help="apply raw brain channels, no altitude hold")
     ap.add_argument("--punish-mag", type=float, default=-2.5,

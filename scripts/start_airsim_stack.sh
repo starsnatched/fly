@@ -13,6 +13,12 @@ cd "$(dirname "$0")/.."
 PY=.venv/Scripts/python.exe
 [ -x "$PY" ] || PY=python3
 
+# TCP port probe (netstat is missing from some Git Bash installs)
+port_open() {
+  "$PY" -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); \
+sys.exit(0 if s.connect_ex(('127.0.0.1', int(sys.argv[1]))) == 0 else 1)" "$1"
+}
+
 # 1. brain -----------------------------------------------------------------
 if ! curl -s --max-time 2 http://127.0.0.1:8788/health | grep -q '"ok":true'; then
   echo "[stack] starting brain server..."
@@ -27,7 +33,7 @@ else
 fi
 
 # 2. AirSim ----------------------------------------------------------------
-if ! netstat -ano | grep -q ":41451.*LISTENING"; then
+if ! port_open 41451; then
   BLOCKS=$(ls airsim/*/WindowsNoEditor/*.exe 2>/dev/null | grep -viE "Binaries|Engine" | head -1)
   if [ -z "$BLOCKS" ]; then
     echo "[stack] no AirSim environment found; run: python scripts/get_airsim.py" >&2
@@ -35,8 +41,8 @@ if ! netstat -ano | grep -q ":41451.*LISTENING"; then
   fi
   echo "[stack] starting $BLOCKS (AirSim)..."
   nohup "./$BLOCKS" -opengl4 > airsim/blocks.log 2>&1 &
-  for _ in $(seq 1 60); do
-    netstat -ano | grep -q ":41451.*LISTENING" && break
+  for _ in $(seq 1 90); do
+    port_open 41451 && break
     sleep 2
   done
 else

@@ -46,9 +46,17 @@ AirSim side:
   - collisions punish (default -2.5) and respawn; parked-car touches reward
     (default +2.5) and respawn. --punish-mag / --reward-mag tune magnitudes.
   - proximity shaping: every 0.5 s a small reward pulse proportional to
-    closeness to the nearest parked car (3D distance; 0 beyond --prox-radius,
-    --prox-max at contact). The brain's relative reward shaping turns this
-    into "closing in on cars is good, retreating is bad". --prox-gain 0 off.
+    closeness to the nearest parked car (3D distance), on two scales — a
+    far gradient (40 m, small) to guide the brain toward a street with
+    cars, and a steeper near gradient (8 m, stronger) for the final
+    approach. The brain's relative reward shaping turns this into
+    "closing in on cars is good, retreating is bad". --prox-gain 0 off.
+  - --cars turns this into a full car-crash curriculum: the respawn point
+    becomes a fresh 14-22 m start next to the target car facing it, and
+    near the target the shaping switches to pure progress — every tick
+    that CLOSES distance pulses a small reward; hovering/retreating sends
+    nothing. Run 1 (fixed spawn, 359 episodes) proved approach rewards
+    alone never bridge the last meters to the jackpot.
 
 Usage:
   python scripts/airsim_drone.py                     # defaults, assist on
@@ -63,6 +71,7 @@ import argparse
 import asyncio
 import json
 import math
+import random
 import struct
 import sys
 import time
@@ -71,6 +80,13 @@ import re
 
 import numpy as np
 import websockets
+
+# ---- the training objective (car-crash curriculum) -------------------------
+# Everything below turns "crash into cars" into a shaped learning problem:
+#   touch car  -> +2.5 (reward-mag) jackpot + respawn
+#   near field -> approach gradient up to +1.0 (near-max) within 8 m
+#   far field  -> approach gradient up to +0.5 (prox-max) within 40 m
+#   anything else -> -2.5 (punish-mag) and respawn
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -90,10 +106,21 @@ YAW_RATE_MAX = 200.0   # deg/s at |yaw stick| = 1 — drastic turns
 STICK_GAIN = 2.0       # sensitivity: amplify the brain's small channel wiggles
 STICK_TAU_S = 0.15     # RC stick inertia (first-order low-pass on each stick)
 CMD_HOLD_S = 0.25      # velocity command hold (re-sent every CMD_PERIOD_S)
+LANE_EXPO = 0.60       # lane curve: lane = min + range * expo(throttle, 0.60)
+                       # (0 = linear; <1 pushes low lanes together so small
+                       # throttle dips reach street level where the cars are)
 
 BRAIN_HOVER = 0.29                     # brain throttle default (drone.json)
 
+
+def expo(x: float, e: float) -> float:
+    """RC expo curve: e=0 -> linear, 0<e<1 -> compressed near 0."""
+    s = clamp(x, 0.0, 1.0)
+    return (1.0 - e) * s + e * s * s * s
+
 RESPAWN_ALT = 8.0      # respawn height above ground (m)
+CAR_SPAWN_ALT = 6.0    # respawn height in cars mode (m) — cars visible early
+CAR_SPAWN_DIST = (14.0, 22.0)  # spawn-distance range from the target car (m)
 GROUND_Z = 0.0         # world-frame z of the ground plane (--ground-z)
 RESPAWN_COOLDOWN_S = 2.5   # ignore collisions this long after a respawn
 
@@ -151,17 +178,27 @@ class Bridge:
         self._last_col_print = 0.0
         self._last_cmd_at = 0.0
         self._grounded_since = 0.0
+        self._ep_origin = (0.0, 0.0)   # XY the current episode started at
         self._ws_ref = None
         self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
         self._stick_at = 0.0
         self._hud = (0.0, 0.0, 0.0, 0.0)
-        self.lane = (self.args.min_alt
-                     + BRAIN_HOVER * (self.args.max_alt - self.args.min_alt))
+        self.lane = self.lane_from_throttle(BRAIN_HOVER)
         self._lane_at = 0.0
         self.car_poses: list[tuple[float, float, float]] = []
+        self._target_idx = 0        # which parked car is the current target
+        self._car_pulses = 0        # approach pulses on the current target
+        self._last_target_near = float("inf")
         self._near_car = float("inf")
         self._prox_val = 0.0
         self._last_prox_t = 0.0
+        # per-episode stats (reset in end_episode)
+        self._ep_start = time.perf_counter()
+        self._ep_near_sum = 0.0
+        self._ep_near_n = 0
+        self._ep_near_min = float("inf")
+        self._ep_dopa_sum = 0.0
+        self._ep_dopa_n = 0
 
     # ---- brain link ------------------------------------------------------
     async def run(self) -> int:
@@ -176,6 +213,12 @@ class Bridge:
         self.spawn = client.simGetGroundTruthKinematics(args.vehicle).position
         self.setup_vehicle(client)
         self.cache_car_poses(client)
+        if args.cars and self.car_poses:
+            self._target_idx = random.randrange(len(self.car_poses))
+            print(f"[cars] training target: car #{self._target_idx} "
+                  f"(of {len(self.car_poses)}); each respawn starts a fresh "
+                  f"14-22 m approach", flush=True)
+        self._ep_origin = (self.spawn.x_val, self.spawn.y_val)
 
         delay = RETRY_BASE_S
         while True:
@@ -255,8 +298,11 @@ class Bridge:
         if now - self._last_respawn < RESPAWN_COOLDOWN_S:
             return
         alt = -kin.position.z_val
-        dx = kin.position.x_val - self.spawn.x_val
-        dy = kin.position.y_val - self.spawn.y_val
+        # leash is measured from where THIS episode started (cars mode
+        # teleports anywhere in the map; a fixed spawn leash would instantly
+        # border-punish every episode)
+        dx = kin.position.x_val - self._ep_origin[0]
+        dy = kin.position.y_val - self._ep_origin[1]
         dist = math.hypot(dx, dy)
         reason = None
         # ceiling punish sits 25 cm inside the blended band edge, so a
@@ -281,8 +327,28 @@ class Bridge:
                   f"respawning (hits {self.collision_count}, ceilings "
                   f"{self.ceiling_hits}, borders {self.border_hits})",
                   flush=True)
+            self.end_episode(reason)
             self.respawn(client)
             self._last_respawn = now
+
+    def end_episode(self, why: str) -> None:
+        """One stats line per episode, so training runs are comparable."""
+        dur = time.perf_counter() - self._ep_start
+        tel = self.telemetry or {}
+        print(f"[episode] {why}  dur {dur:5.1f} s  hits {self.collision_count}  "
+              f"cars {self.car_bumps}  ceilings {self.ceiling_hits}  "
+              f"borders {self.border_hits}  "
+              f"near-avg {self._ep_near_sum / max(self._ep_near_n, 1):5.1f} m  "
+              f"near-min {self._ep_near_min:5.1f} m  "
+              f"closing {self._car_pulses}  "
+              f"dopa-avg {self._ep_dopa_sum / max(self._ep_dopa_n, 1):+.3f}",
+              flush=True)
+        self._ep_start = time.perf_counter()
+        self._ep_near_sum = 0.0
+        self._ep_near_n = 0
+        self._ep_near_min = float("inf")
+        self._ep_dopa_sum = 0.0
+        self._ep_dopa_n = 0
 
     async def proximity_reward(self, ws, kin, now: float) -> None:
         """Continuous shaping stream: a small reward pulse every 0.5 s,
@@ -290,7 +356,15 @@ class Bridge:
         The brain's relative shaping (tau 12 s) adapts to any steady value,
         so what actually gets reinforced is the GRADIENT: closing in on a
         car drives dopamine up, drifting away drives it down — a guidance
-        signal toward the +2.5 car-touch event, without drowning it."""
+        signal toward the +2.5 car-touch event, without drowning it.
+
+        Two scales (car-crash training):
+          far  — linear over --prox-radius (40 m), small (--prox-max 0.5):
+                 gets the brain into the right street from cruise distance;
+          near — steeper over --near-radius (8 m), stronger (--near-max 1.0):
+                 a clear approach gradient once a car is actually in sight.
+        The near max stays below the car-touch reward, so touching a car
+        always pays more than hovering over it."""
         if self.args.prox_gain <= 0.0 or not self.car_poses:
             self._prox_val = 0.0
             return
@@ -301,8 +375,29 @@ class Bridge:
         d2 = min((p.x_val - x) ** 2 + (p.y_val - y) ** 2 + (p.z_val - z) ** 2
                  for x, y, z in self.car_poses)
         self._near_car = math.sqrt(d2)
-        v = (self.args.prox_gain * self.args.prox_max
-             * clamp(1.0 - self._near_car / self.args.prox_radius, 0.0, 1.0))
+        if (self.args.cars and self.args.prox_gain > 0.0
+                and self._near_car <= self.args.prox_radius):
+            # near the training target: pure PROGRESS signal. Hovering and
+            # retreating send nothing (the brain's relative shaping treats
+            # silence as neutral); each 0.5 s tick that CLOSED distance
+            # pulses a small reward proportional to meters gained. This is
+            # the dense approach signal that leads to the +2.5 jackpot.
+            if self._last_target_near == float("inf"):
+                pass                        # first reading: baseline only
+            elif self._near_car < self._last_target_near:
+                gained = self._last_target_near - self._near_car
+                v = min(self.args.closing_gain * gained, 0.5)
+                self._car_pulses += 1
+                self._prox_val = v
+                await ws.send(json.dumps(
+                    {"type": "reward", "value": round(v, 3)}))
+            self._last_target_near = self._near_car
+            return
+        v = self.args.prox_gain * (
+            self.args.prox_max
+            * clamp(1.0 - self._near_car / self.args.prox_radius, 0.0, 1.0)
+            + self.args.near_max
+            * clamp(1.0 - self._near_car / self.args.near_radius, 0.0, 1.0))
         self._prox_val = v
         if v > 0.0:
             await ws.send(json.dumps({"type": "reward", "value": round(v, 3)}))
@@ -339,6 +434,12 @@ class Bridge:
                 self.recover_if_stuck(client, kin, now)
                 self.check_bounds(client, kin, now)
                 await self.proximity_reward(ws, kin, now)
+                if math.isfinite(self._near_car):
+                    self._ep_near_sum += self._near_car
+                    self._ep_near_n += 1
+                    self._ep_near_min = min(self._ep_near_min, self._near_car)
+                self._ep_dopa_sum += self.dopa
+                self._ep_dopa_n += 1
                 await self.maybe_reward(client, ws, now)
                 if now - self._last_tel_req > 1.0:
                     self._last_tel_req = now
@@ -440,26 +541,42 @@ class Bridge:
         print(f"[sim] collision [{obj or 'unknown'}] -> {sign} {mag:+.1f}; "
               f"respawning (hits {self.collision_count}, "
               f"cars {self.car_bumps})", flush=True)
+        self.end_episode("collision" if not is_car else "car touch")
         self.respawn(client)
         self._last_respawn = now
 
     def respawn(self, client) -> None:
-        """Back to the spawn XY facing down the street, at an ABSOLUTE
-        respawn altitude above the ground plane (never relative to wherever
-        the drone was when the bridge started)."""
+        """Cars mode: teleport next to a random parked car (the target is
+        picked at startup), facing it, close enough that the car is inside
+        the retina and the near-field gradient. Street mode: back to the
+        spawn XY at the ABSOLUTE respawn altitude (never relative to
+        wherever the drone was when the bridge started)."""
         pose = client.simGetVehiclePose(self.args.vehicle)
-        sp = self.spawn
-        pose.position.x_val = sp.x_val
-        pose.position.y_val = sp.y_val
-        pose.position.z_val = self.args.ground_z - RESPAWN_ALT  # NED: up = -z
-        pose.orientation = airsim.Quaternionr(0.0, 0.0, 0.0, 1.0)  # level, initial heading
+        if self.args.cars:
+            x, y, _z = self.car_poses[self._target_idx]
+            ang = random.uniform(0.0, 2.0 * math.pi)
+            dist = random.uniform(*CAR_SPAWN_DIST)
+            pose.position.x_val = x + dist * math.cos(ang)
+            pose.position.y_val = y + dist * math.sin(ang)
+            pose.position.z_val = self.args.ground_z - CAR_SPAWN_ALT  # NED
+            yaw = math.atan2(y - pose.position.y_val, x - pose.position.x_val)
+            pose.orientation = airsim.Quaternionr(
+                0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+        else:
+            sp = self.spawn
+            pose.position.x_val = sp.x_val
+            pose.position.y_val = sp.y_val
+            pose.position.z_val = self.args.ground_z - RESPAWN_ALT  # NED: up = -z
+            pose.orientation = airsim.Quaternionr(0.0, 0.0, 0.0, 1.0)  # level, initial heading
         client.simSetVehiclePose(pose, True, self.args.vehicle)
+        self._ep_origin = (pose.position.x_val, pose.position.y_val)
         # kill any stale brain stick bias so the fresh episode starts calm
         self.cmd = {"throttle": BRAIN_HOVER, "pitch": 0.0, "roll": 0.0, "yaw": 0.0}
         self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
         self._ceil_since = 0.0
-        self.lane = (self.args.min_alt
-                     + BRAIN_HOVER * (self.args.max_alt - self.args.min_alt))
+        self._last_target_near = float("inf")   # fresh approach baseline
+        self._car_pulses = 0
+        self.lane = self.lane_from_throttle(BRAIN_HOVER)
         client.moveByVelocityBodyFrameAsync(
             0.0, 0.0, -1.5, 1.0,
             airsim.DrivetrainType.MaxDegreeOfFreedom,
@@ -469,6 +586,15 @@ class Bridge:
 
     # ---- act -------------------------------------------------------------
     CMD_PERIOD_S = 0.05  # 20 Hz command refresh (SimpleFlight holds the rest)
+
+    def lane_from_throttle(self, throttle: float) -> float:
+        """Throttle -> target altitude. RC expo curve (LANE_EXPO): the low
+        half of the throttle range is compressed toward the floor, so the
+        brain's small down-dips actually select street-level lanes where the
+        cars are — without that, a high-lane cruising brain can never touch
+        one (episode 1: 41 collisions, 0 car touches)."""
+        frac = expo(clamp(throttle, 0.0, 1.0), LANE_EXPO)
+        return self.args.min_alt + frac * (self.args.max_alt - self.args.min_alt)
 
     def compute_sticks(self, now: float) -> dict[str, float]:
         """Brain channels -> RC sticks, with real FPV feel:
@@ -517,9 +643,7 @@ class Bridge:
             kin = client.simGetGroundTruthKinematics(self.args.vehicle)
             alt = -kin.position.z_val
             # the selected lane glides RC-style, then the controller chases it
-            lane_t = (self.args.min_alt
-                      + clamp(self.cmd["throttle"], 0.0, 1.0)
-                      * (self.args.max_alt - self.args.min_alt))
+            lane_t = self.lane_from_throttle(self.cmd["throttle"])
             dt = clamp(now - self._lane_at, 0.001, 0.2) if self._lane_at else 0.05
             self._lane_at = now
             a = (1.0 if self.args.stick_tau <= 0
@@ -608,7 +732,8 @@ class Bridge:
               f"sticks fwd {sticks[0]:+5.1f} lat {sticks[1]:+5.1f} "
               f"vz {sticks[2]:+5.1f} m/s yaw {sticks[3]:+6.1f} deg/s  "
               f"hits {self.collision_count}  cars {self.car_bumps}  "
-              f"near {self._near_car:5.1f} m  prox {self._prox_val:+.2f}  "
+              f"near {self._near_car:5.1f} m  min {self._ep_near_min:4.1f} m  "
+              f"pulses {self._car_pulses:3d}  prox {self._prox_val:+.2f}  "
               f"dopa {self.dopa:+.3f} "
               f"learn {'on' if self.learning else 'off'}  "
               f"sim {sim_ms:.1f} ms  act {stale*1000:.0f} ms ago", flush=True)
@@ -625,8 +750,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--eyes", choices=["center", "stereo"], default="center",
                     help="center: one forward camera to both eyes; "
                          "stereo: +-35 deg left/right pair")
-    ap.add_argument("--min-alt", type=float, default=2.5,
-                    help="ground safety band lower edge (m)")
+    ap.add_argument("--min-alt", type=float, default=1.0,
+                    help="ground safety band lower edge (m); below car-roof "
+                         "height (~1.5 m) so car touches are possible")
     ap.add_argument("--max-alt", type=float, default=30.0,
                     help="ceiling safety band upper edge (m)")
     ap.add_argument("--stick-gain", type=float, default=STICK_GAIN,
@@ -648,6 +774,17 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="nearest-car distance beyond which prox reward is 0 (m)")
     ap.add_argument("--prox-max", type=float, default=0.5,
                     help="proximity reward pulse value at 0 m distance")
+    ap.add_argument("--near-radius", type=float, default=8.0,
+                    help="near-field approach-gradient radius (m)")
+    ap.add_argument("--near-max", type=float, default=1.0,
+                    help="near-field reward at 0 m (must stay below reward-mag "
+                         "so touching a car still pays more than hovering over it)")
+    ap.add_argument("--cars", action="store_true",
+                    help="car-crash curriculum: every respawn starts a fresh "
+                         "14-22 m approach to the current target car")
+    ap.add_argument("--closing-gain", type=float, default=0.1,
+                    help="cars mode: reward per meter closed toward the "
+                         "target car (capped at 0.5 per pulse)")
     ap.add_argument("--no-assist", action="store_true",
                     help="apply raw brain channels, no altitude hold")
     ap.add_argument("--punish-mag", type=float, default=-2.5,

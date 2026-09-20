@@ -97,7 +97,7 @@ flight controller does all prop mixing and attitude stabilization:
 |---|---|---|
 | `pitch` | forward/backward body velocity | ±12 m/s |
 | `roll` | left/right body velocity | ±9 m/s |
-| `throttle` | **altitude lane selector** (position control) | 2.5–30 m lane |
+| `throttle` | **altitude lane selector** (position control, expo curve) | 1–30 m lane |
 | `yaw` | yaw rate | ±200°/s |
 
 Sticks get real FPV feel: `--stick-gain` (default 2.0) amplifies the brain's
@@ -109,12 +109,16 @@ throttle channel selects a target altitude lane between `--min-alt` and
 (`--control rate`) is available, but the untrained throttle bias kept it
 pushing skyward — under lane control "climb bias" just means holding a
 higher lane, and ceiling punishments map onto the throttle values that chose
-them (clean credit assignment for R-STDP).
+them (clean credit assignment for R-STDP). The lane curve uses an RC expo
+(`LANE_EXPO` 0.6): the low half of the throttle range is compressed toward
+the floor, so small throttle dips select street-level lanes — throttle 0.29
+(hover) sits at 4.8 m, 0.10 at 2.2 m, 0.0 at 1 m, where the parked cars are.
 
 Vision defaults to the **forward center camera streamed to both eyes** (the
 retina's two hemispheres each read half the image); `--eyes stereo` switches to
 the ±35° left/right pair. The brain's throttle fully owns altitude; a safety
-band only pushes back within ~1 m of `--min-alt` (2.5 m) / `--max-alt` (30 m).
+band only pushes back within ~1 m of `--min-alt` (1.0 m — below car-roof
+height, so car touches are physically possible) / `--max-alt` (30 m).
 A takeoff/recovery routine lifts the drone if it gets knocked to the ground.
 
 **Collision policy:** every collision sends a strong punishment pulse
@@ -129,13 +133,38 @@ additionally enables classic reward shaping (altitude + forward progress) on
 top of the event pulses.
 
 **Proximity reward:** every 0.5 s the bridge also streams a small shaping
-pulse proportional to closeness of the nearest parked car (3D distance,
-linear to 0 beyond `--prox-radius` 40 m, `--prox-max` 0.5 at contact). The
+pulse proportional to closeness of the nearest parked car (3D distance), on
+two scales — a **far gradient** (linear to 0 beyond `--prox-radius` 40 m,
+`--prox-max` 0.5 at contact) that guides the brain toward a street with cars
+from cruise distance, and a **near gradient** (steeper, within
+`--near-radius` 8 m, up to `--near-max` 1.0 at contact) for the final
+approach. The near max stays below the +2.5 car touch, so touching a car
+always pays more than hovering over one. The
 brain's relative reward shaping (τ = 12 s) adapts to any steady value, so
 this reinforces the *gradient*: closing in on a car is good, drifting away
-is bad — a guidance signal toward the +2.5 car touch, without drowning it.
-The HUD line shows `near <d> m` and `prox <+v>` live; `--prox-gain 0`
-disables it. The 70 parked-car poses are cached once at startup.
+is bad. The HUD line shows `near <d> m`, `min <d> m` (episode best) and
+`prox <+v>` live; `--prox-gain 0` disables it. The 70 parked-car poses are
+cached once at startup.
+
+**Car-crash training recipe** — to train the brain to crash into cars:
+
+```bash
+python scripts/reset_brain_memory.py --full   # fresh start
+bash scripts/start_airsim_stack.sh --cars     # brain + AirSimNH + car curriculum
+```
+
+`--cars` is the training curriculum: every respawn teleports the drone to a
+fresh 14–22 m start next to the current target car, facing it, and near the
+target the shaping switches to pure progress — each 0.5 s tick that *closes*
+distance pulses a small reward (`--closing-gain` 0.1/m, capped 0.5), while
+hovering or retreating sends nothing. Without it, episodes start from one
+fixed spawn and the approach gradient alone never bridged the last meters
+to the jackpot (359 episodes, 0 touches).
+
+Watch the `[episode]` lines the bridge prints on every respawn (duration,
+hits, car touches, closest approach, closing pulses, mean dopamine) —
+`closing` should climb toward double digits per episode and `cars` should
+tick up once approaches start connecting with the +2.5 jackpot.
 
 **Resetting learned memory:**
 
@@ -144,10 +173,11 @@ python scripts/reset_brain_memory.py           # wipe the live brain (hash-verif
 python scripts/reset_brain_memory.py --full    # wipe + set aside the disk memory file
 ```
 
-Useful flags: `--vision-hz 120` (web client's retina rate), `--min-alt 2.5`
+Useful flags: `--vision-hz 120` (web client's retina rate), `--min-alt 1.0`
 / `--max-alt 30` (safety band), `--control lane|rate` (altitude scheme),
 `--stick-gain 2.0` / `--stick-tau 0.15` (FPV stick feel),
 `--ceil-ride 2` / `--border-radius 450` (bounds policy),
+`--prox-max 0.5` / `--near-max 1.0` / `--near-radius 8` (shaping scales),
 `--no-assist`, `--eyes stereo|center`, `--reward alt`.
 
 ## Talking to the brain

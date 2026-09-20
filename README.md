@@ -194,6 +194,37 @@ hits, car touches, closest approach, closing pulses, mean dopamine) —
 `closing` should climb toward double digits per episode and `cars` should
 tick up once approaches start connecting with the +2.5 jackpot.
 
+**Training from video — no labels, no simulator.** The circuit's plasticity
+is dopamine-gated R-STDP, so raw video alone changes nothing — but the video
+itself can be the teacher: `scripts/train_from_video.py` streams any video
+file (or a webcam) into the retina in the same wire format the flying bridge
+uses, and pulses the reward line when something visually notable happens
+(frame-difference spikes: scene cuts, sudden appearances). The synapses that
+were co-active at that moment get strengthened; when a busy scene goes
+static again, the engine's own baseline adaptation produces a negative error
+and depresses what stopped mattering. No actions are commanded or needed —
+the brain's motor output is ignored.
+
+```bash
+# dedicated video brain (ports 8791/8792, memory state/video-memory.json -
+# your flight memory in state/brain-memory.json stays untouched)
+./build/flybrain-server.exe --config config/video-brain.json --profile config/profiles/drone.json &
+python scripts/train_from_video.py myflight.mp4 --loop
+
+python scripts/train_from_video.py myflight.mp4 --brain-ws ws://127.0.0.1:8787/stream   # train the flying quad brain itself
+python scripts/train_from_video.py --camera 0                     # live webcam
+```
+
+Verified live: 45 s of a test clip with 6 scene changes (+3.0 pulses) moved
+**371 plastic synapses** past the 1% meaningful-edit bar (`memEdited 1 ->
+372`) with zero control labels. Flags: `--cut-thresh` (event sensitivity,
+default 0.08 mean-abs-diff), `--reward-mag` (pulse size, default 3.0 —
+magnitude is the teaching lever, same as flight), `--cooldown` (min seconds
+between pulses), `--speed`, `--fps`, `--duration`. The `[done]` summary
+reports `memEdited` before/after so you can confirm learning happened; the
+resulting visual memory then rides along in whichever brain you fly later
+(same retina, same connectome).
+
 **Resetting learned memory:**
 
 ```bash

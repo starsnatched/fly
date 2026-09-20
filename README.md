@@ -136,16 +136,29 @@ world**: a second brain (`config/wing-brain.json`, ports 8789/8790, memory
 with its own connectome, R-STDP memory and car curriculum. The wing flew the
 project's first car touch within minutes of its first training session.
 
-**Collision policy:** every collision sends a strong punishment pulse
-(default **−2.5**) to the brain and respawns the drone at the start point —
-*except* collisions with parked cars (`Car_*` in AirSimNH), which send a
-strong **+2.5 reward** (touching cars is the task). Riding the ceiling
-(`--max-alt`) for more than `--ceil-ride` seconds (2 s) or leaving the spawn
-leash (`--border-radius`, 450 m) punishes and respawns the same way.
-`--punish-mag` / `--reward-mag` tune the magnitudes. Each event names the
-object hit (or `ceiling` / `map border`) in the bridge log. `--reward alt`
-additionally enables classic reward shaping (altitude + forward progress) on
-top of the event pulses.
+**Collision policy (dopa-tail-aware stun protocol):** every collision sends
+one deep punishment pulse (default **−5.0** — measured live, a −5 pulse
+reaches the brain's `dan_drive` clamp and produces a **77% deeper dopamine
+teaching window** than the old −2.5; pulse *trains* were tested and are
+worse, since the drive decays with τ=300 ms and just sustains). Then the
+bridge **holds the crash scene** — the quad freezes in place, the wing
+levels and glides straight ahead (a plane can't hover), with no proximity
+or shaping pulses — until the brain's dopamine error recovers above
+`DOPA_RECOVER` (−0.03; hard cap `--stun-max` 6.5 s, minimum hold
+`--stun-hold` 4.5 s). This matters because the measured negative-dopa tail
+lasts **4.5–6 s**: respawning immediately dumps the tail onto the *next*
+episode's good flying while the crash-context synapses get less LTD than
+they should. Holding the scene keeps the negative window overlapped with
+the synapses that caused the crash — clean credit assignment. Car touches
+(`Car_*` in AirSimNH) send **+2.5** with a short 1.5 s hold so the positive
+tail doesn't spuriously reinforce the next episode's opening moves. Riding
+the ceiling (`--max-alt`) for more than `--ceil-ride` seconds (2 s) or
+leaving the per-episode spawn leash (`--border-radius`, 450 m) punishes the
+same way. `--punish-mag` / `--reward-mag` tune the magnitudes. Each event
+names the object hit (or `ceiling` / `map border`) in the bridge log, and
+the HUD shows `STUN[...]` with remaining hold time and live dopa during the
+hold. `--reward alt` additionally enables classic reward shaping (altitude
++ forward progress) on top of the event pulses.
 
 **Proximity reward:** every 0.5 s the bridge also streams a small shaping
 pulse proportional to closeness of the nearest parked car (3D distance), on
@@ -154,8 +167,8 @@ two scales — a **far gradient** (linear to 0 beyond `--prox-radius` 40 m,
 from cruise distance, and a **near gradient** (steeper, within
 `--near-radius` 8 m, up to `--near-max` 1.0 at contact) for the final
 approach. The near max stays below the +2.5 car touch, so touching a car
-always pays more than hovering over one. The
-brain's relative reward shaping (τ = 12 s) adapts to any steady value, so
+always pays more than hovering over one.
+The brain's relative reward shaping (τ = 12 s) adapts to any steady value, so
 this reinforces the *gradient*: closing in on a car is good, drifting away
 is bad. The HUD line shows `near <d> m`, `min <d> m` (episode best) and
 `prox <+v>` live; `--prox-gain 0` disables it. The 70 parked-car poses are

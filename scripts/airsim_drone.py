@@ -146,6 +146,25 @@ CAR_SPAWN_DIST = (14.0, 22.0)  # spawn-distance range from the target car (m)
 GROUND_Z = 0.0         # world-frame z of the ground plane (--ground-z)
 RESPAWN_COOLDOWN_S = 2.5   # ignore collisions this long after a respawn
 
+# ---- punishment protocol (dopa-tail-aware) ----------------------------------
+# Measured live on the wing brain (cengine source + dopamine probes):
+#   * dan_drive clamps at +-1.5 and decays with tau 300 ms, so a pulse TRAIN
+#     only sustains the suppression — the MAGNITUDE of one deep step is the
+#     teaching lever (-5.0 gave a 77% deeper dopamine window than -2.5);
+#   * the negative dopamine error then lasts 4.5-6 s (fast drive + slow
+#     baseline re-adaptation), yet the old protocol respawned ~0.3 s after
+#     the crash — dumping the tail onto the NEXT episode's good flying and
+#     giving the crash-context synapses less LTD than they should get.
+# New protocol: one deep pulse, then HOLD the crash scene (retina keeps the
+# context, motors frozen so recovery isn't accidentally punished) until the
+# dopamine error recovers — only then respawn onto a clean slate.
+PUNISH_MAG_DEFAULT = -5.0   # lands as dan_drive -1.5 (the clamp) = deepest window
+REWARD_MAG_DEFAULT = 2.5
+STUN_HOLD_S = 4.5           # minimum scene-hold after a punish (dopa tail 4.5-6 s)
+STUN_MAX_S = 6.5            # hard cap; dopa recovery usually releases earlier
+DOPA_RECOVER = -0.03        # respawn gate: dopa error above this = tail drained
+POSITIVE_HOLD_S = 1.5       # shorter hold after car rewards (positive tail)
+
 CEILING_RIDE_S = 2.0    # pinned at/above the ceiling this long -> punish
 BORDER_RADIUS_M = 450.0 # horizontal leash from the spawn point (map border)
 
@@ -200,6 +219,11 @@ class Bridge:
         self._last_col_print = 0.0
         self._last_cmd_at = 0.0
         self._grounded_since = 0.0
+        self._stun_until = 0.0    # event stun: scene held until this time
+        self._stun_pending = 0.0  # stun start ts (0 = no respawn pending)
+        self._sim_ready = False   # one-time sim setup done (survives retries)
+        self._stun_mag = 0.0      # signed event magnitude, for the status line
+        self._stun_why = ""
         self._ep_origin = (0.0, 0.0)   # XY the current episode started at
         self._ws_ref = None
         self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
@@ -228,44 +252,52 @@ class Bridge:
 
     # ---- brain link ------------------------------------------------------
     async def run(self) -> int:
+        """Everything — sim connect, one-time setup, brain link — lives inside
+        the retry loop, so a sim crash (the iGPU AirSimNH build dies under
+        long sessions) heals automatically: the bridge waits for the RPC
+        port, re-attaches, and resumes training without a restart."""
         args = self.args
         client = airsim.MultirotorClient(ip=args.airsim_ip, port=args.airsim_port)
-        client.confirmConnection()
-        vehicles = client.listVehicles()
-        print(f"[airsim] connected; vehicles: {vehicles}")
-        if args.vehicle not in vehicles:
-            print(f"[airsim] vehicle {args.vehicle!r} not in {vehicles}")
-            return 1
-        self.spawn = client.simGetGroundTruthKinematics(args.vehicle).position
-        # car poses BEFORE setup_vehicle: the wing's catapult respawn already
-        # needs the car list (and the quad's takeoff runs a velocity climb)
-        self.cache_car_poses(client)
-        self.setup_vehicle(client)
-        if args.airframe == "wing":
-            print(f"[wing] airframe=wing: throttle->airspeed, elevator->"
-                  f"climb, aileron->banked turn; stall below {WING_V_MIN:.0f} "
-                  f"m/s; catapult respawns", flush=True)
-        if args.cars and self.car_poses:
-            self._target_idx = random.randrange(len(self.car_poses))
-            print(f"[cars] training target: car #{self._target_idx} "
-                  f"(of {len(self.car_poses)}); each respawn starts a fresh "
-                  f"14-22 m approach", flush=True)
-        self._ep_origin = (self.spawn.x_val, self.spawn.y_val)
 
         delay = RETRY_BASE_S
         while True:
-            print(f"[bridge] connecting to brain at {args.brain_ws}")
             try:
+                client.confirmConnection()
+                vehicles = client.listVehicles()
+                if args.vehicle not in vehicles:
+                    print(f"[airsim] vehicle {args.vehicle!r} not in "
+                          f"{vehicles}; waiting", flush=True)
+                    raise RuntimeError("vehicle missing")
+                if not self._sim_ready:
+                    print(f"[airsim] connected; vehicles: {vehicles}", flush=True)
+                    self.spawn = client.simGetGroundTruthKinematics(
+                        args.vehicle).position
+                    # car poses BEFORE setup_vehicle: the wing's catapult
+                    # respawn already needs the car list (and the quad's
+                    # takeoff runs a velocity climb)
+                    self.cache_car_poses(client)
+                    self.setup_vehicle(client)
+                    if args.airframe == "wing":
+                        print(f"[wing] airframe=wing: throttle->airspeed, "
+                              f"elevator->climb, aileron->banked turn; stall "
+                              f"below {WING_V_MIN:.0f} m/s; catapult respawns",
+                              flush=True)
+                    if args.cars and self.car_poses:
+                        self._target_idx = random.randrange(len(self.car_poses))
+                        print(f"[cars] training target: car #{self._target_idx} "
+                              f"(of {len(self.car_poses)}); each respawn starts "
+                              f"a fresh 14-22 m approach", flush=True)
+                    self._ep_origin = (self.spawn.x_val, self.spawn.y_val)
+                    self._sim_ready = True
+                print(f"[bridge] connecting to brain at {args.brain_ws}")
                 async with websockets.connect(
                         args.brain_ws, open_timeout=30, max_size=32 * 2**20) as ws:
                     await self.handshake(ws)
                     delay = RETRY_BASE_S
                     await self.flight_loop(client, ws)
-            except (websockets.exceptions.ConnectionClosed, OSError) as exc:
-                print(f"[bridge] brain link lost ({exc}); retrying", flush=True)
             except KeyboardInterrupt:
                 return 0
-            except Exception as exc:  # keep the sim alive across brain restarts
+            except Exception as exc:  # sim crash / brain restart / link loss
                 print(f"[bridge] error: {exc!r}; retrying", flush=True)
             await asyncio.sleep(delay)
             delay = min(RETRY_MAX_S, delay * 1.5)
@@ -313,7 +345,11 @@ class Bridge:
 
     def recover_if_stuck(self, client, kin, now: float) -> None:
         """Grounded recovery: if we sit at/below ground with no motion for a
-        while (wedged, or knocked down), teleport up and take off again."""
+        while (wedged, or knocked down), teleport up and take off again.
+        Suppressed during a stun: a dazed crashed aircraft stays put until
+        the dopamine tail has drained onto the crash context."""
+        if self.in_stun():
+            return
         alt = -kin.position.z_val
         speed = math.sqrt(kin.linear_velocity.x_val ** 2
                           + kin.linear_velocity.y_val ** 2
@@ -332,6 +368,8 @@ class Bridge:
         """Ceiling and map-border policy: riding the ceiling or leaving the
         spawn leash is a punish + respawn, exactly like a collision."""
         if now - self._last_respawn < RESPAWN_COOLDOWN_S:
+            return
+        if self.in_stun() or self._stun_pending:
             return
         alt = -kin.position.z_val
         # leash is measured from where THIS episode started (cars mode
@@ -365,12 +403,13 @@ class Bridge:
                 self.border_hits += 1
             asyncio.get_running_loop().create_task(
                 self.send_reward_now(self.args.punish_mag))
+            self.begin_event_stun(self.args.punish_mag, reason)
             print(f"[sim] {reason} -> punish {self.args.punish_mag:+.1f}; "
-                  f"respawning (hits {self.collision_count}, ceilings "
-                  f"{self.ceiling_hits}, borders {self.border_hits})",
+                  f"holding scene until dopa recovers (hits "
+                  f"{self.collision_count}, ceilings {self.ceiling_hits}, "
+                  f"borders {self.border_hits})",
                   flush=True)
             self.end_episode(reason)
-            self.respawn(client)
             self._last_respawn = now
 
     def end_episode(self, why: str) -> None:
@@ -410,6 +449,8 @@ class Bridge:
         if self.args.prox_gain <= 0.0 or not self.car_poses:
             self._prox_val = 0.0
             return
+        if self.in_stun():
+            return    # keep the event window clean of shaping pulses
         if now - self._last_prox_t < 0.5:
             return
         self._last_prox_t = now
@@ -475,6 +516,16 @@ class Bridge:
                 kin = client.simGetGroundTruthKinematics(self.args.vehicle)
                 self.recover_if_stuck(client, kin, now)
                 self.check_bounds(client, kin, now)
+                # stun release: hold ended AND dopamine recovered -> respawn
+                if self._stun_pending and not self.in_stun() \
+                        and (self.dopa > DOPA_RECOVER
+                             or now - self._stun_pending > self.args.stun_max):
+                    print(f"[sim] stun over -> respawn "
+                          f"(dopa {self.dopa:+.3f}, held "
+                          f"{now - self._stun_pending:.1f} s)", flush=True)
+                    self._stun_pending = 0.0
+                    self.respawn(client)
+                    self._last_respawn = now
                 await self.proximity_reward(ws, kin, now)
                 if math.isfinite(self._near_car):
                     self._ep_near_sum += self._near_car
@@ -561,6 +612,10 @@ class Bridge:
         now = time.perf_counter()
         if now - self._last_respawn < RESPAWN_COOLDOWN_S:
             return
+        if self.in_stun() or self._stun_pending:
+            return    # event already registered; a wedged aircraft keeps
+                      # producing fresh collision timestamps every tick —
+                      # they're the SAME crash, not new events
         # has_collided latches after an impact; a NEW event is a new time_stamp
         ts = float(col.time_stamp) if col is not None else 0.0
         fresh = (col is not None and col.has_collided
@@ -580,12 +635,36 @@ class Bridge:
             sign = "punish"
         asyncio.get_running_loop().create_task(
             self.send_reward_now(mag))
+        self.begin_event_stun(mag, "car touch" if is_car else "collision")
         print(f"[sim] collision [{obj or 'unknown'}] -> {sign} {mag:+.1f}; "
-              f"respawning (hits {self.collision_count}, "
-              f"cars {self.car_bumps})", flush=True)
+              f"holding scene until dopa recovers "
+              f"(hits {self.collision_count}, cars {self.car_bumps})", flush=True)
         self.end_episode("collision" if not is_car else "car touch")
-        self.respawn(client)
-        self._last_respawn = now
+
+    # ---- punishment / reward protocol ------------------------------------
+    def begin_event_stun(self, mag: float, why: str) -> None:
+        """After a big event (punish or car reward), HOLD the current scene
+        for a while before respawning.
+
+        Why (measured on the live brain): one deep pulse leaves the dopamine
+        error negative for 4.5-6 s — respawning immediately dumps that tail
+        onto the NEXT episode's opening moves, punishing good flying, while
+        the crash-context synapses get less LTD than they should. Holding
+        the scene keeps the negative window overlapped with the synapses
+        that caused the event: clean credit assignment. Rewards get a short
+        hold so their positive tail can't spuriously reinforce the next
+        episode's first moves either."""
+        wing = self.args.airframe == "wing"
+        hold = POSITIVE_HOLD_S if mag > 0.0 else self.args.stun_hold
+        if wing and mag < 0.0:
+            hold = max(hold, 2.5)     # a plane can't freeze; still hold the view
+        self._stun_until = time.perf_counter() + hold
+        self._stun_pending = time.perf_counter()
+        self._stun_mag = mag
+        self._stun_why = why
+
+    def in_stun(self) -> bool:
+        return time.perf_counter() < self._stun_until
 
     def respawn(self, client) -> None:
         """Cars mode: teleport next to a random parked car (the target is
@@ -741,13 +820,30 @@ class Bridge:
           rate — the old normalized climb-rate stick (needs --no-assist
               to be fully raw)."""
         if self.args.airframe == "wing":
-            self.apply_wing_model(client, now)
+            if self.in_stun():
+                # dazed plane: wings level, gentle climb out, glide straight
+                # ahead at cruise (a fixed wing cannot hover) — nothing new
+                # commanded; the climb usually exits ground/canopy wedges
+                self._hud = (self._wing_v, 0.0, 2.0, 0.0)
+                client.moveByVelocityBodyFrameAsync(
+                    self._wing_v, 0.0, -2.0, CMD_HOLD_S + self.CMD_PERIOD_S,
+                    airsim.DrivetrainType.MaxDegreeOfFreedom,
+                    airsim.YawMode(False, 0.0),
+                    self.args.vehicle,
+                )
+            else:
+                self.apply_wing_model(client, now)
             return
         if now - self._last_cmd_at < self.CMD_PERIOD_S:
             return
         self._last_cmd_at = now
         s = self.compute_sticks(now)
-        if self.args.control == "lane" and not self.args.no_assist:
+        if self.in_stun():
+            # dazed quad: freeze the stick demands so nothing further is
+            # punished and the crash view stays put for the retina
+            self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
+            s = self.stick
+        elif self.args.control == "lane" and not self.args.no_assist:
             kin = client.simGetGroundTruthKinematics(self.args.vehicle)
             alt = -kin.position.z_val
             # the selected lane glides RC-style, then the controller chases it
@@ -806,6 +902,8 @@ class Bridge:
     async def maybe_reward(self, client, ws, now: float) -> None:
         if not self.args.reward:
             return
+        if self.in_stun():
+            return    # keep the event window clean of shaping pulses
         if now - self._last_reward_t < 0.5:
             return
         self._last_reward_t = now
@@ -834,6 +932,11 @@ class Bridge:
         tel = self.telemetry or {}
         sim_ms = tel.get("simMs", 0.0)
         stale = time.perf_counter() - self._actions_at
+        stun = ""
+        if self.in_stun():
+            left = self._stun_until - time.perf_counter()
+            stun = (f"  STUN[{self._stun_why} {self._stun_mag:+.1f}] "
+                    f"{left:4.1f}s dopa {self.dopa:+.2f}")
         sticks = self._hud
         wing = (f"v {self._wing_v:4.1f} m/s bank {self._wing_roll:+5.1f} deg  "
                 if self.args.airframe == "wing" else "")
@@ -903,10 +1006,20 @@ def parse_args(argv=None) -> argparse.Namespace:
                          "target car (capped at 0.5 per pulse)")
     ap.add_argument("--no-assist", action="store_true",
                     help="apply raw brain channels, no altitude hold")
-    ap.add_argument("--punish-mag", type=float, default=-2.5,
-                    help="reward pulse value sent on a collision")
-    ap.add_argument("--reward-mag", type=float, default=2.5,
+    ap.add_argument("--punish-mag", type=float, default=PUNISH_MAG_DEFAULT,
+                    help="collision punish pulse; -5.0 reaches the brain's "
+                         "dan_drive clamp (-1.5) = deepest teaching window "
+                         "(measured 77%% deeper dopamine than -2.5)")
+    ap.add_argument("--reward-mag", type=float, default=REWARD_MAG_DEFAULT,
                     help="reward pulse value sent on a car touch")
+    ap.add_argument("--stun-hold", type=float, default=STUN_HOLD_S,
+                    help="minimum seconds to hold the crash scene before "
+                         "respawn (the negative dopa window is 4.5-6 s); "
+                         "respawn also waits for dopa recovery (cap "
+                         f"{STUN_MAX_S} s)")
+    ap.add_argument("--stun-max", type=float, default=STUN_MAX_S,
+                    help="hard cap on the scene hold even if dopa has not "
+                         "recovered (s)")
     ap.add_argument("--reward", choices=["alt"], default=None,
                     help="optional additional reward shaping (altitude+progress)")
     return ap.parse_args(argv)

@@ -30,6 +30,33 @@
           "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0
         }
       }
+    },
+    "Wing1": {
+      "VehicleType": "SimpleFlight",
+      "EnableCollisions": true,
+      "Cameras": {
+        "0": {
+          "CaptureSettings": [
+            { "ImageType": 0, "Width": 192, "Height": 108, "FOV_Degrees": 90.0 }
+          ],
+          "X": 0.10, "Y": 0.0, "Z": 0.0,
+          "Roll": 0.0, "Pitch": 0.0, "Yaw": -35.0
+        },
+        "1": {
+          "CaptureSettings": [
+            { "ImageType": 0, "Width": 192, "Height": 108, "FOV_Degrees": 90.0 }
+          ],
+          "X": 0.10, "Y": 0.0, "Z": 0.0,
+          "Roll": 0.0, "Pitch": 0.0, "Yaw": 35.0
+        },
+        "2": {
+          "CaptureSettings": [
+            { "ImageType": 0, "Width": 192, "Height": 108, "FOV_Degrees": 90.0 }
+          ],
+          "X": 0.10, "Y": 0.0, "Z": 0.0,
+          "Roll": 0.0, "Pitch": 0.0, "Yaw": 0.0
+        }
+      }
     }
   }
 }

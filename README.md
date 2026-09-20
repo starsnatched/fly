@@ -121,6 +121,21 @@ band only pushes back within ~1 m of `--min-alt` (1.0 m — below car-roof
 height, so car touches are physically possible) / `--max-alt` (30 m).
 A takeoff/recovery routine lifts the drone if it gets knocked to the ground.
 
+**Fixed-wing aircraft:** stock AirSim has no fixed-wing physics, so the bridge
+adds a point-mass wing model on top of the velocity API
+(`--airframe wing`, vehicle `Wing1`): the same four brain channels become
+plane controls — throttle → airspeed (10–24 m/s, **stall below 10**), pitch →
+elevator (climb/sink, climbing bleeds airspeed), roll → bank angle (banked
+coordinated turns, `g·tan(bank)/V`, capped 45°), yaw → rudder. Respawns are
+airborne catapult launches at cruise speed, 6 m higher (planes can't
+hover-takeoff), and the ceiling policy gives the wing +5 m and 3× the ride
+tolerance (a 45° bank bulges turns ~1.6× and it can't stop).
+`bash scripts/start_airsim_stack.sh --wing` runs **both aircraft in the same
+world**: a second brain (`config/wing-brain.json`, ports 8789/8790, memory
+`state/wing-memory.json`) flies Wing1 while the quad brain flies Fly1 — each
+with its own connectome, R-STDP memory and car curriculum. The wing flew the
+project's first car touch within minutes of its first training session.
+
 **Collision policy:** every collision sends a strong punishment pulse
 (default **−2.5**) to the brain and respawns the drone at the start point —
 *except* collisions with parked cars (`Car_*` in AirSimNH), which send a

@@ -38,6 +38,12 @@ AirSim side:
   - vision: ONE forward-facing center camera (camera "2"); its frame is
     streamed to BOTH eyes (0 and 1) so the connectome's full bilateral
     retina sees the same view. --eyes stereo restores the +-35 deg pair.
+  - --airframe wing swaps the quad for a fixed-wing point-mass flight
+    model on the same brain channels: throttle -> airspeed (10-24 m/s,
+    stall below 10), pitch -> elevator (climb/sink), roll -> bank angle
+    (banked coordinated turns), yaw -> rudder. SimpleFlight does attitude
+    animation; the model does the flight physics. Respawns are airborne
+    catapult launches at cruise speed (planes don't hover-takeoff).
   - the connectome decode cannot hover by construction (no altitude
     feedback in the motor pools), so the bridge keeps the drone inside a
     ground/ceiling safety band: the brain's throttle FULLY owns climb and
@@ -109,6 +115,22 @@ CMD_HOLD_S = 0.25      # velocity command hold (re-sent every CMD_PERIOD_S)
 LANE_EXPO = 0.60       # lane curve: lane = min + range * expo(throttle, 0.60)
                        # (0 = linear; <1 pushes low lanes together so small
                        # throttle dips reach street level where the cars are)
+
+# ---- fixed-wing flight model (--airframe wing) ------------------------------
+# Stock AirSim has no fixed-wing physics, so the bridge flies the Wing1
+# SimpleFlight vehicle through a point-mass wing model implemented on top of
+# the velocity API: banked coordinated turns, throttle -> airspeed, and
+# climb-bleeds-speed energy coupling. The brain flies something that behaves
+# like a plane: it cannot hover, must keep flying to stay up, and turns by
+# banking.
+WING_V_MIN = 10.0      # stall speed (m/s): below this the wing drops
+WING_V_MAX = 24.0      # airspeed at full throttle
+WING_CLIMB_MAX = 4.0   # m/s climb at full up-elevator (at cruise speed)
+WING_SINK_MAX = 5.0    # m/s descent at full down-elevator
+WING_ROLL_MAX = 45.0   # bank angle at full aileron
+WING_TURN_RATE = 70.0  # deg/s cap on the banked turn rate
+WING_ENERGY = 0.55     # climb costs airspeed (m/s per m/s of climb)
+WING_RUDDER_RATE = 15.0  # deg/s of extra yaw from the rudder stick
 
 BRAIN_HOVER = 0.29                     # brain throttle default (drone.json)
 
@@ -183,6 +205,10 @@ class Bridge:
         self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
         self._stick_at = 0.0
         self._hud = (0.0, 0.0, 0.0, 0.0)
+        # fixed-wing state
+        self._wing_v = 15.0    # current airspeed (m/s)
+        self._wing_roll = 0.0  # current bank (deg)
+        self._last_wing_at = 0.0
         self.lane = self.lane_from_throttle(BRAIN_HOVER)
         self._lane_at = 0.0
         self.car_poses: list[tuple[float, float, float]] = []
@@ -211,8 +237,14 @@ class Bridge:
             print(f"[airsim] vehicle {args.vehicle!r} not in {vehicles}")
             return 1
         self.spawn = client.simGetGroundTruthKinematics(args.vehicle).position
-        self.setup_vehicle(client)
+        # car poses BEFORE setup_vehicle: the wing's catapult respawn already
+        # needs the car list (and the quad's takeoff runs a velocity climb)
         self.cache_car_poses(client)
+        self.setup_vehicle(client)
+        if args.airframe == "wing":
+            print(f"[wing] airframe=wing: throttle->airspeed, elevator->"
+                  f"climb, aileron->banked turn; stall below {WING_V_MIN:.0f} "
+                  f"m/s; catapult respawns", flush=True)
         if args.cars and self.car_poses:
             self._target_idx = random.randrange(len(self.car_poses))
             print(f"[cars] training target: car #{self._target_idx} "
@@ -260,10 +292,14 @@ class Bridge:
         self.takeoff(client)
 
     def takeoff(self, client) -> None:
-        """Un-stick (spawn can be below the collision surface, which pins the
-        physics resolver), teleport to a clean absolute altitude, then climb
-        a little. Absolute z (ground-z - 8) instead of relative, so a spawn
-        captured mid-air can never push the drone above the ceiling."""
+        """Quad: un-stick (spawn can be below the collision surface, which
+        pins the physics resolver), teleport to a clean absolute altitude,
+        then climb a little. Absolute z (ground-z - 8) instead of relative,
+        so a spawn captured mid-air can never push the drone above the
+        ceiling. Wing: airplanes don't take off from hover — catapult."""
+        if self.args.airframe == "wing":
+            self.respawn(client)
+            return
         print("[airsim] takeoff", flush=True)
         pose = client.simGetVehiclePose(self.args.vehicle)
         pose.position.z_val = self.args.ground_z - RESPAWN_ALT  # NED: up = -z
@@ -306,11 +342,17 @@ class Bridge:
         dist = math.hypot(dx, dy)
         reason = None
         # ceiling punish sits 25 cm inside the blended band edge, so a
-        # saturated climb that equilibrates right at the ceiling still counts
-        if alt >= self.args.max_alt - 0.25:
+        # saturated climb that equilibrates right at the ceiling still counts.
+        # The wing turns with up to 45 deg of bank, which bulges its path
+        # outward ~1.6x, and it cannot stop — so its ceiling sits higher and
+        # the ride tolerance is 3x longer before punishing.
+        wing = self.args.airframe == "wing"
+        ceil_m = self.args.max_alt + (5.0 if wing else 0.0)
+        ceil_ride = self.args.ceil_ride * (3.0 if wing else 1.0)
+        if alt >= ceil_m - 0.25:
             if self._ceil_since == 0.0:
                 self._ceil_since = now
-            elif now - self._ceil_since > self.args.ceil_ride:
+            elif now - self._ceil_since > ceil_ride:
                 reason = "ceiling"
         else:
             self._ceil_since = 0.0
@@ -552,13 +594,16 @@ class Bridge:
         spawn XY at the ABSOLUTE respawn altitude (never relative to
         wherever the drone was when the bridge started)."""
         pose = client.simGetVehiclePose(self.args.vehicle)
-        if self.args.cars:
+        wing = self.args.airframe == "wing"
+        spawn_alt = (CAR_SPAWN_ALT if self.args.cars else RESPAWN_ALT) \
+            + (6.0 if wing else 0.0)   # planes spawn higher: they can't hover
+        if self.args.cars and self.car_poses:
             x, y, _z = self.car_poses[self._target_idx]
             ang = random.uniform(0.0, 2.0 * math.pi)
             dist = random.uniform(*CAR_SPAWN_DIST)
             pose.position.x_val = x + dist * math.cos(ang)
             pose.position.y_val = y + dist * math.sin(ang)
-            pose.position.z_val = self.args.ground_z - CAR_SPAWN_ALT  # NED
+            pose.position.z_val = self.args.ground_z - spawn_alt  # NED
             yaw = math.atan2(y - pose.position.y_val, x - pose.position.x_val)
             pose.orientation = airsim.Quaternionr(
                 0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
@@ -566,10 +611,20 @@ class Bridge:
             sp = self.spawn
             pose.position.x_val = sp.x_val
             pose.position.y_val = sp.y_val
-            pose.position.z_val = self.args.ground_z - RESPAWN_ALT  # NED: up = -z
+            pose.position.z_val = self.args.ground_z - spawn_alt  # NED: up = -z
             pose.orientation = airsim.Quaternionr(0.0, 0.0, 0.0, 1.0)  # level, initial heading
         client.simSetVehiclePose(pose, True, self.args.vehicle)
         self._ep_origin = (pose.position.x_val, pose.position.y_val)
+        if self.args.airframe == "wing":
+            # catapult launch: airborne at cruise speed, level wings
+            self._wing_v = WING_V_MIN + 5.0
+            self._wing_roll = 0.0
+            client.moveByVelocityBodyFrameAsync(
+                self._wing_v, 0.0, 0.0, 0.4,
+                airsim.DrivetrainType.MaxDegreeOfFreedom,
+                airsim.YawMode(False, 0.0),
+                self.args.vehicle,
+            )
         # kill any stale brain stick bias so the fresh episode starts calm
         self.cmd = {"throttle": BRAIN_HOVER, "pitch": 0.0, "roll": 0.0, "yaw": 0.0}
         self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
@@ -586,6 +641,56 @@ class Bridge:
 
     # ---- act -------------------------------------------------------------
     CMD_PERIOD_S = 0.05  # 20 Hz command refresh (SimpleFlight holds the rest)
+
+    def apply_wing_model(self, client, now: float) -> None:
+        """Fixed-wing point-mass model on top of the SimpleFlight velocity
+        API. The brain's channels become plane controls:
+          throttle -> airspeed setpoint (WING_V_MIN..WING_V_MAX)
+          pitch    -> elevator: climb (+) / sink (-); climbing bleeds speed
+          roll     -> bank angle; bank rate = g*tan(bank)/V, capped — the
+                      classic coordinated turn
+          yaw      -> rudder: small extra yaw rate
+        below stall speed the wing drops until speed recovers. SimpleFlight
+        animates the attitude; this model does the flight dynamics."""
+        if now - self._last_wing_at < self.CMD_PERIOD_S:
+            return
+        dt = now - self._last_wing_at if self._last_wing_at else 0.05
+        self._last_wing_at = now
+        c = self.cmd
+        # airspeed follows the throttle channel
+        v_t = WING_V_MIN + clamp(c["throttle"], 0.0, 1.0) \
+            * (WING_V_MAX - WING_V_MIN)
+        self._wing_v += (v_t - self._wing_v) * min(1.0, dt * 0.6)
+        # elevator + energy coupling: climbing bleeds airspeed, diving adds
+        climb_dem = clamp(c["pitch"], -1.0, 1.0)
+        climb = climb_dem * (WING_CLIMB_MAX if climb_dem > 0 else WING_SINK_MAX)
+        self._wing_v -= WING_ENERGY * max(climb, 0.0) * dt
+        self._wing_v = clamp(self._wing_v, 6.0, WING_V_MAX + 2.0)
+        stall = self._wing_v < WING_V_MIN
+        if stall:
+            climb = min(climb, -3.0)      # the wing drops
+        # bank -> turn rate (coordinated turn), capped
+        roll_t = WING_ROLL_MAX * clamp(c["roll"] * self.args.stick_gain,
+                                       -1.0, 1.0)
+        self._wing_roll += (roll_t - self._wing_roll) * min(1.0, dt * 2.5)
+        turn = math.degrees(math.tan(math.radians(abs(self._wing_roll)))) \
+            * 9.81 / max(self._wing_v, 8.0)
+        turn = clamp(turn, 0.0, WING_TURN_RATE) * (1 if self._wing_roll >= 0 else -1)
+        rudder = -clamp(c["yaw"], -1.0, 1.0) * WING_RUDDER_RATE
+        # body-frame velocity: forward at airspeed, sideslip = bank
+        fwd = self._wing_v * math.cos(math.radians(abs(self._wing_roll)))
+        lat = self._wing_v * math.sin(math.radians(self._wing_roll))
+        kin = client.simGetGroundTruthKinematics(self.args.vehicle)
+        alt = -kin.position.z_val
+        if alt < 0.8:                     # never terrace-crash into the ground
+            climb = max(climb, 2.0)
+        self._hud = (fwd, lat, climb, turn + rudder)
+        client.moveByVelocityBodyFrameAsync(
+            fwd, lat, -climb, CMD_HOLD_S + self.CMD_PERIOD_S,
+            airsim.DrivetrainType.MaxDegreeOfFreedom,
+            airsim.YawMode(False, 0.0),   # yaw rate comes from bank + rudder
+            self.args.vehicle,
+        )
 
     def lane_from_throttle(self, throttle: float) -> float:
         """Throttle -> target altitude. RC expo curve (LANE_EXPO): the low
@@ -635,6 +740,9 @@ class Bridge:
               that chose them — clean credit assignment for R-STDP).
           rate — the old normalized climb-rate stick (needs --no-assist
               to be fully raw)."""
+        if self.args.airframe == "wing":
+            self.apply_wing_model(client, now)
+            return
         if now - self._last_cmd_at < self.CMD_PERIOD_S:
             return
         self._last_cmd_at = now
@@ -727,8 +835,11 @@ class Bridge:
         sim_ms = tel.get("simMs", 0.0)
         stale = time.perf_counter() - self._actions_at
         sticks = self._hud
-        print(f"[fly] alt {alt:5.1f} m  lane {self.lane:5.1f} m  "
-              f"spd {speed:4.1f} m/s  "
+        wing = (f"v {self._wing_v:4.1f} m/s bank {self._wing_roll:+5.1f} deg  "
+                if self.args.airframe == "wing" else "")
+        print(f"[{'wing' if self.args.airframe == 'wing' else 'fly'}] "
+              f"alt {alt:5.1f} m  lane {self.lane:5.1f} m  "
+              f"spd {speed:4.1f} m/s  {wing}"
               f"sticks fwd {sticks[0]:+5.1f} lat {sticks[1]:+5.1f} "
               f"vz {sticks[2]:+5.1f} m/s yaw {sticks[3]:+6.1f} deg/s  "
               f"hits {self.collision_count}  cars {self.car_bumps}  "
@@ -754,7 +865,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="ground safety band lower edge (m); below car-roof "
                          "height (~1.5 m) so car touches are possible")
     ap.add_argument("--max-alt", type=float, default=30.0,
-                    help="ceiling safety band upper edge (m)")
+                    help="ceiling safety band upper edge (m); the wing gets "
+                         "+5 m and 3x the ride tolerance automatically")
+    ap.add_argument("--airframe", choices=["quad", "wing"], default="quad",
+                    help="quad: SimpleFlight multirotor; wing: fixed-wing "
+                         "flight model (throttle->airspeed, elevator->climb, "
+                         "banked turns, stall, catapult respawns)")
     ap.add_argument("--stick-gain", type=float, default=STICK_GAIN,
                     help="sensitivity multiplier on every stick (pre-clamp)")
     ap.add_argument("--stick-tau", type=float, default=STICK_TAU_S,

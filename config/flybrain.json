@@ -19,34 +19,87 @@
   "memoryPath": "state/brain-memory.json",
   "sensors": {
     "visionHz": 120,
-    "eyes": { "count": 2, "leftId": 0, "rightId": 1 },
-    "touch": { "burstMv": 6.0 },
+    "eyes": {
+      "count": 2,
+      "leftId": 0,
+      "rightId": 1
+    },
+    "touch": {
+      "burstMv": 6.0
+    },
     "scalarRanges": {
-      "altitude": [0.0, 30.0],
-      "speed": [0.0, 18.0],
-      "vy": [-8.0, 8.0],
-      "clearance": [0.0, 60.0],
+      "altitude": [
+        0.0,
+        30.0
+      ],
+      "speed": [
+        0.0,
+        18.0
+      ],
+      "vy": [
+        -8.0,
+        8.0
+      ],
+      "clearance": [
+        0.0,
+        60.0
+      ],
       "tauScale": 9.0
     }
   },
   "readout": {
     "dnHzScale": 8.0,
     "map": [
-      { "channel": "throttle", "signal": "motorDrive", "gain": 0.65, "offset": -0.11 },
-      { "channel": "throttle", "signal": "flowPitch",  "gain": 1.2, "shape": "tanh" },
-      { "channel": "pitch",    "signal": "dnDrive",    "gain": 0.55, "offset": -0.69 },
-      { "channel": "pitch",    "signal": "flowRoll",   "gain": 1.2, "shape": "tanh" },
-      { "channel": "yaw",      "signal": "dnSteer",    "gain": 6.0, "shape": "tanh" },
-      { "channel": "yaw",      "signal": "flowYaw",    "gain": 6.0, "shape": "tanh" },
-      { "channel": "roll",     "signal": "flowRoll",   "gain": 1.2, "shape": "tanh" }
+      {
+        "channel": "throttle",
+        "signal": "motorDrive",
+        "gain": 0.65,
+        "offset": -0.11
+      },
+      {
+        "channel": "pitch",
+        "signal": "dnDrive",
+        "gain": 0.55,
+        "offset": -0.69
+      },
+      {
+        "channel": "yaw",
+        "signal": "dnSteer",
+        "gain": 6.0,
+        "shape": "tanh"
+      }
     ]
   },
   "actuators": {
     "channels": [
-      { "name": "throttle", "lo": 0.0, "hi": 1.0, "slewPerS": 6.0, "default": 0.29 },
-      { "name": "pitch", "lo": -1.0, "hi": 1.0, "slewPerS": 8.0, "default": -0.35 },
-      { "name": "roll", "lo": -1.0, "hi": 1.0, "slewPerS": 8.0, "default": 0.0 },
-      { "name": "yaw", "lo": -1.0, "hi": 1.0, "slewPerS": 8.0, "default": 0.0 }
+      {
+        "name": "throttle",
+        "lo": 0.0,
+        "hi": 1.0,
+        "slewPerS": 6.0,
+        "default": 0.29
+      },
+      {
+        "name": "pitch",
+        "lo": -1.0,
+        "hi": 1.0,
+        "slewPerS": 8.0,
+        "default": -0.35
+      },
+      {
+        "name": "roll",
+        "lo": -1.0,
+        "hi": 1.0,
+        "slewPerS": 8.0,
+        "default": 0.0
+      },
+      {
+        "name": "yaw",
+        "lo": -1.0,
+        "hi": 1.0,
+        "slewPerS": 8.0,
+        "default": 0.0
+      }
     ]
   },
   "reward": {

@@ -23,14 +23,11 @@ AirSim side:
     controller does all prop mixing and attitude stabilization:
       pitch stick  -> forward/backward body-frame velocity
       roll stick   -> left/right body-frame velocity
-      throttle     -> SELECTS a target altitude lane (min_alt..max_alt);
-                      a P controller climbs/descends to hold it. Position
-                      control: the untrained throttle bias can no longer
-                      produce endless climbing — a wiggle changes the lane
-                      instead of integrating into continuous ascent, and
-                      ceiling punishment maps directly onto the throttle
-                      values that caused it. --control rate restores the
-                      old climb-rate stick.
+      throttle     -> climb-rate demand, relative to the EPISODE'S
+                      calibrated hover point (per-episode frozen trim,
+                      like pitch/roll/yaw). Rate control: a resting
+                      throttle pool holds altitude, deviations climb or
+                      descend proportionally.
       yaw stick    -> yaw RATE
       every stick is amplified (--stick-gain) then low-passed (--stick-tau)
       to behave like real RC sticks: the brain's brief wiggles become
@@ -80,11 +77,14 @@ import math
 import random
 import struct
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
 
 import numpy as np
+import cv2
 import websockets
 
 # ---- the training objective (car-crash curriculum) -------------------------
@@ -101,21 +101,72 @@ import airsim  # noqa: E402  (vendored in scripts/airsim, MIT licensed)
 
 # ---- embodiment constants (mirrors examples/drone-web) ---------------------
 W, H = 192, 108
-DEFAULT_VISION_HZ = 60          # --vision-hz 120 matches the web client
+DEFAULT_VISION_HZ = 0           # 0 = stream eyes AS FAST as the sim renders
+                                # (the value is a cap, never adds delay on
+                                # top of capture time; this iGPU sim renders
+                                # ~3.7 fps, which is the real ceiling)
+
+# ---- fly vision (--eyes fly) ------------------------------------------------
+# A housefly's visual system, as far as reasonably simulable with two perspective
+# cameras: near-panoramic wrap-around binocular field (Musca sees ~270 deg front
+# + a rear sliver), ommatidial optics (each facet's own PSF -> low acuity),
+# and photoreceptor response tuned to a green world with a fast phasic
+# (band-pass) transient channel — the motion pathway that feeds the lobula.
+# The brain receives the RESULT (192x108 per eye, same wire format), so the
+# connectome genuinely sees through fly eyes.
+FLY_EYE_FOV_DEG = 130.0   # per-camera FOV: 2 x 130 front + 2 x ~55 rear wraps
+                          # most of the sphere around the drone
+FLY_EYE_REAR_YAW = 115.0  # rear pair yaw: 360 - 2*130 = 100 deg gap, covered
+                          # by two 130-deg rear cameras at +-115 deg
+FLY_EYE_PITCH = 0.0       # level with the horizon (flies ride level)
+FLY_PHOT_GAIN = 1.25      # photoreceptor gain (bumped: R1-6 press the signal
+                          # into a narrower range -> darker eyes than a camera)
+FLY_PHOT_SIGMA = 0.42     # photoreceptor soft-saturation (Naka-Rushton-ish)
+FLY_GREEN_W = (0.25, 0.70, 0.05)  # R1-6 weighting: strongly green-weighted
+                          # (the fly's peak sensitivity, and its favorite color)
+FLY_TRANSIENT_TAU_S = 0.055  # LMC-style high-pass: this much of the previous
+                          # response is subtracted each frame (phasic channel)
+FLY_TRANSIENT_GAIN = 2.2  # transient (motion) channel strength in the mix
+FLY_BLUR_SIGMA = 0.9      # ommatidial PSF blur (pixels @192x108): facet
+                          # diffraction/aberration -> acuity ~a few degrees
+FLY_NOISE = 0.015         # photon-shot-like noise floor
+FLY_VIEWER_PORT = 8795    # built-in MJPEG viewer (http://localhost:8795)
+FLY_PANO_W = 720          # panorama width: 2 deg per pixel over 360 deg
+FLY_PANO_H = 120          # panorama height: +-60 deg vertical field
+FLY_EYE_CAMS = ("0", "2", "3", "1")   # front-left, front-right,
+                          # rear-left, rear-right (wrap/camera order)
+FLY_EYE_WINDOW_DEG = 240.0  # per-eye angular width: wide fly-like field
+FLY_EYE_OFFBORE_DEG = 30.0  # each window is centered this far off
+                            # boresight (left eye left, right eye right)
+                            # for stereo; forward flow then radiates from
+                            # near the retina CENTER — the geometry the
+                            # brain has always seen (hemisphere-per-eye
+                            # put the front at the retina edge and the
+                            # brain's forward prior broke: it flew
+                            # backward)
 
 # ---- AirSim joystick envelope (SimpleFlight) -------------------------------
 V_FWD_MAX = 12.0       # m/s at |pitch stick| = 1 (web convention: -pitch = fwd)
+CMD_HOLD_S = 0.5       # SimpleFlight velocity-command hold (s): > 1/cmd period
+                       # so consecutive 20 Hz commands chain without gaps
 V_LAT_MAX = 9.0        # m/s at |roll stick| = 1 — strong avoidance authority
-VZ_MAX = 7.0           # m/s climb/descent demand at |climb stick| = 1
-ALT_P_GAIN = 0.9       # lane-mode altitude controller (m/s per m of error)
-YAW_RATE_MAX = 200.0   # deg/s at |yaw stick| = 1 — drastic turns
-STICK_GAIN = 2.0       # sensitivity: amplify the brain's small channel wiggles
+VZ_MAX = 9.0           # m/s climb/descent demand at |climb stick| = 1
+ALT_P_GAIN = 1.6       # lane-mode altitude controller (m/s per m of error)
+YAW_RATE_MAX = 350.0   # deg/s at |yaw stick| = 1 — race-quad yaw
+YAW_HOLD_EPS = 40.0    # below this yaw demand: rate mode off (the
+                       # flight controller damps rotation) — a units
+                       # translation, applied to the brain's own value
+STICK_GAIN = 3.0       # sensitivity: amplify the brain's small channel wiggles
+                       # (0.33 channel deviation from trim = full deflection)
 STICK_TAU_S = 0.15     # RC stick inertia (first-order low-pass on each stick)
-CMD_HOLD_S = 0.25      # velocity command hold (re-sent every CMD_PERIOD_S)
-LANE_EXPO = 0.60       # lane curve: lane = min + range * expo(throttle, 0.60)
-                       # (0 = linear; <1 pushes low lanes together so small
-                       # throttle dips reach street level where the cars are)
-
+TRIM_SAMPLE_S = 1.5    # per-episode trim calibration window (s): the median
+                       # of resting samples becomes the channel center for
+                       # the WHOLE episode (frozen — unlike a continuous EMA
+                       # trim, sustained flight commands are never absorbed)
+TRIM_QUIET_STDEV = 0.06  # a calibration window with more channel movement
+                       # than this is a command, not rest — resample
+TRIM_MAX_WINDOWS = 4   # calibration attempts before accepting the median
+STICK_DEADBAND = 0.05  # channel deadband around the trim center (stick units)
 # ---- fixed-wing flight model (--airframe wing) ------------------------------
 # Stock AirSim has no fixed-wing physics, so the bridge flies the Wing1
 # SimpleFlight vehicle through a point-mass wing model implemented on top of
@@ -132,7 +183,14 @@ WING_TURN_RATE = 70.0  # deg/s cap on the banked turn rate
 WING_ENERGY = 0.55     # climb costs airspeed (m/s per m/s of climb)
 WING_RUDDER_RATE = 15.0  # deg/s of extra yaw from the rudder stick
 
-BRAIN_HOVER = 0.29                     # brain throttle default (drone.json)
+BRAIN_HOVER = 0.29                     # fallback hover throttle if the
+                                       # physical probe fails. Throttle is
+                                       # ABSOLUTE brain output: 0 = no
+                                       # throttle = sink at the aircraft's
+                                       # physical rate; the MEASURED hover
+                                       # point (below) is the zero-climb
+                                       # reference, not any brain statistic.
+PHYS_HOVER_DEFAULT = 0.30              # probe overwrites at sim connect
 
 
 def expo(x: float, e: float) -> float:
@@ -186,6 +244,173 @@ def pack_eye_frame(eye: int, rgb: np.ndarray) -> bytes:
     return struct.pack("<BBHHB", 1, eye, W, H, 3) + rgb.tobytes()
 
 
+# ---- fly-vision optics (--eyes fly) -----------------------------------------
+# The four fisheye captures are stitched into a wrap-around panorama, then
+# processed the way a fly's visual system is: spectral weighting (R1-6 favor
+# green), ommatidial blur (facet PSF -> low acuity, wide acceptance angle),
+# Naka-Rushton photoreceptor saturation, and a phasic high-pass channel
+# (LMC-style) that emphasizes CHANGE - the motion pathway the lobula reads.
+
+def _fly_wrap(rgbs: list[np.ndarray | None]) -> np.ndarray:
+    """Stitch the four fisheye captures into one 360x120 deg panorama.
+    Panorama x maps 180 deg per half-width (retina pixel density), y maps
+    +-60 deg. Each camera only paints the sector its optical axis covers;
+    remap with BORDER_TRANSPARENT leaves the rest untouched."""
+    pano = np.zeros((FLY_PANO_H, FLY_PANO_W, 3), dtype=np.uint8)
+    ys, xs = np.mgrid[0:FLY_PANO_H, 0:FLY_PANO_W].astype(np.float32)
+    dx = (xs - 0.5 * FLY_PANO_W) / (0.5 * FLY_PANO_W) * 180.0   # -180..180
+    py = (0.5 - ys / FLY_PANO_H) * 120.0                        # +60..-60
+    for img, yc in zip(rgbs, (0.0, 180.0,
+                              -FLY_EYE_REAR_YAW, FLY_EYE_REAR_YAW)):
+        if img is None:
+            continue
+        hs, ws_ = img.shape[:2]
+        cx = (dx - yc) / (0.5 * FLY_EYE_FOV_DEG) * (0.5 * ws_) + 0.5 * ws_
+        cy = (0.5 * FLY_EYE_FOV_DEG - py) / FLY_EYE_FOV_DEG * hs
+        cv2.remap(img, cx, cy, cv2.INTER_LINEAR, dst=pano,
+                  borderMode=cv2.BORDER_TRANSPARENT)
+    return pano
+
+
+_FLY_PREV: dict[str, np.ndarray | None] = {"L": None, "R": None}
+
+
+def _fly_photoreceptors(rgb: np.ndarray) -> np.ndarray:
+    """Green-weighted R1-6 response with soft saturation and shot noise.
+    Returns float32 [0,1] at retina resolution."""
+    lin = (rgb.astype(np.float32) / 255.0) ** 2.2          # sRGB -> linear
+    g = lin @ np.array(FLY_GREEN_W, dtype=np.float32)      # spectral weighting
+    v = np.clip(g * FLY_PHOT_GAIN, 0.0, None)
+    resp = v / (v + FLY_PHOT_SIGMA)                        # Naka-Rushton
+    resp = np.clip(resp + np.random.normal(0.0, FLY_NOISE, resp.shape),
+                   0.0, 1.0).astype(np.float32)
+    return cv2.resize(resp, (W, H), interpolation=cv2.INTER_AREA)
+
+
+def _fly_eye(pano: np.ndarray, right: bool, key: str) -> np.ndarray:
+    """One eye's full pipeline: wide off-boresight window, photoreceptors,
+    ommatidial blur, phasic transient mix. Output u8 (H, W) - exactly the
+    frame the brain's retina receives.
+
+    Geometry: each eye samples a 240-deg-wide, full-height window of the
+    wrap-around panorama centered FLY_EYE_OFFBORE_DEG off boresight (left
+    eye to the left, right eye to the right). The front therefore lands
+    near the retina CENTER in both eyes, so forward optic flow expands
+    centrally the way the connectome has always seen it, while the pair
+    still wraps ~300 deg around the drone (rear +-30 deg gap). Images are
+    unmirrored (world-left = image-left, camera convention)."""
+    az_c = -FLY_EYE_OFFBORE_DEG if not right else FLY_EYE_OFFBORE_DEG
+    cx = 0.5 * FLY_PANO_W + az_c / (360.0 / FLY_PANO_W)   # pano col (2 deg/px)
+    off = (np.arange(W, dtype=np.float32) - 0.5 * W) \
+        * (FLY_EYE_WINDOW_DEG / W)                        # deg from center
+    cols = np.clip(cx + off / (360.0 / FLY_PANO_W), 0, FLY_PANO_W - 1)
+    rows = np.arange(H, dtype=np.float32) * (FLY_PANO_H / float(H))
+    map_x = np.tile(cols[None, :], (H, 1)).astype(np.float32)
+    map_y = np.tile(rows[:, None], (1, W)).astype(np.float32)
+    crop = cv2.remap(pano, map_x, map_y, cv2.INTER_LINEAR)
+    phot = _fly_photoreceptors(crop)
+    lam = cv2.GaussianBlur(phot, (0, 0), FLY_BLUR_SIGMA)
+    prev = _FLY_PREV[key]
+    _FLY_PREV[key] = lam
+    if prev is not None:
+        tran = np.clip((lam - prev) * FLY_TRANSIENT_GAIN, -1.0, 1.0)
+    else:
+        tran = np.zeros_like(lam)
+    out = np.clip(lam + 0.35 * tran, 0.0, 1.0)
+    return (out * 255.0).astype(np.uint8)
+
+
+def fly_eye_left(pano: np.ndarray) -> np.ndarray:
+    return _fly_eye(pano, right=False, key="L")
+
+
+def fly_eye_right(pano: np.ndarray) -> np.ndarray:
+    return _fly_eye(pano, right=True, key="R")
+
+
+_FLY_VIEWER_HTML = b"""<!doctype html>
+<html><head><title>fly vision</title><style>
+ body{background:#0c0f0c;color:#9f9;font-family:ui-monospace,monospace;margin:16px}
+ h3{margin:4px 0} img{image-rendering:pixelated;width:768px;max-width:96vw;
+ border:1px solid #2a3a2a;border-radius:6px} p{color:#5f7f5f;max-width:768px}
+</style></head><body>
+<h3>what the fly brain sees</h3>
+<img id=f src="/frame?t=0">
+<p>top: the two retinas after full fly-vision processing (300-deg
+wrap-around windows centered 30 deg off boresight, ommatidial optics,
+green-weighted photoreceptors, phasic motion channel) &mdash; LEFT EYE |
+RIGHT EYE, each the exact 192x108 frame streamed to the connectome.
+bottom: the raw wrap-around panorama before the optics.</p>
+<script>setInterval(()=>{f.src='/frame?t='+Date.now()},66)</script>
+</body></html>"""
+
+
+_FLY_NOFRAME_JPEG: bytes | None = None   # placeholder before first frame
+
+
+class _FlyViewerHandler(BaseHTTPRequestHandler):
+    bridge: "Bridge" | None = None
+
+    def do_GET(self):  # noqa: N802 (http.server API)
+        try:
+            self._do_get()
+        except (BrokenPipeError, ConnectionResetError):
+            pass   # viewer tab polling faster than we produce frames
+
+    def _do_get(self):
+        if self.path.startswith("/frame"):
+            with self.bridge._fly_state_lock:
+                jpeg = self.bridge._fly_jpeg
+            if jpeg is None:
+                jpeg = _FLY_NOFRAME_JPEG   # placeholder, never an error
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpeg)))
+            self.end_headers()
+            self.wfile.write(jpeg)
+        elif self.path in ("/", "/fly"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(_FLY_VIEWER_HTML)))
+            self.end_headers()
+            self.wfile.write(_FLY_VIEWER_HTML)
+        else:
+            self.send_error(404)
+
+    def log_message(self, *args):  # silence request logging
+        pass
+
+
+def start_fly_viewer(bridge: "Bridge", port: int) -> None:
+    if port <= 0:
+        return
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), _FlyViewerHandler)
+    except OSError as exc:
+        print(f"[viewer] port {port} unavailable ({exc!r}); "
+              f"fly viewer disabled", flush=True)
+        return
+    global _FLY_NOFRAME_JPEG
+    if _FLY_NOFRAME_JPEG is None:
+        ok, buf = cv2.imencode(
+            ".jpg", np.full((228, 384, 3), 30, np.uint8))
+        _FLY_NOFRAME_JPEG = buf.tobytes() if ok else b""
+    _FlyViewerHandler.bridge = bridge
+    threading.Thread(target=srv.serve_forever, daemon=True,
+                     name="fly-viewer").start()
+    print(f"[viewer] fly vision at http://localhost:{port} "
+          f"(exactly what the brain's retinas receive)", flush=True)
+
+
+def _stdev(xs: list[float]) -> float:
+    """Population standard deviation (trim quietness check)."""
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    m = sum(xs) / n
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / n)
+
+
 def decode_action(msg: bytes) -> dict[str, float]:
     """[10 u8][nameLen u16][names JSON][f32*n] -> {channel: value}."""
     if len(msg) < 3 or msg[0] != 10:
@@ -211,8 +436,6 @@ class Bridge:
         self._ceil_since = 0.0
         self._last_col_ts = 0.0
         self._last_respawn = 0.0
-        self._reward_prog = 0.0
-        self._last_reward_t = 0.0
         self._last_tel_req = 0.0
         self._last_status = 0.0
         self._actions_at = 0.0
@@ -223,24 +446,44 @@ class Bridge:
         self._stun_pending = 0.0  # stun start ts (0 = no respawn pending)
         self._sim_ready = False   # one-time sim setup done (survives retries)
         self._stun_mag = 0.0      # signed event magnitude, for the status line
+        self._fly_state: dict | None = None  # fly-vision viewer state
+        self._fly_state_lock = threading.Lock()
+        self._fly_jpeg: bytes | None = None
+        self._vision_hz_ema = 0.0   # achieved eye rate (captures are the
+                                    # pacing on slow sims — see flight_loop)
+        self._last_hide_assert = 0.0
         self._stun_why = ""
         self._ep_origin = (0.0, 0.0)   # XY the current episode started at
         self._ws_ref = None
         self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
         self._stick_at = 0.0
+        # auto-trim: each attitude channel's resting value (None = pending
+        # first brain action); centered sticks are deflections FROM this
+        self.trim = {"pitch": None, "roll": None, "yaw": None}
+        self._trim_at = 0.0
+        self._trim_samples: list[tuple[float, dict[str, float]]] = []
+        self._trim_windows = 0
         self._hud = (0.0, 0.0, 0.0, 0.0)
+        # parallel eye capture pool: one RPC connection+thread per camera.
+        # The sim's RPC serializes per connection, but its render pipeline
+        # takes captures CONCURRENTLY — 4 sockets fetch ~4x faster than one
+        # (measured 58-66 vs 10-15 captures/s). Threads die with the sim and
+        # are rebuilt on reconnect (the old client objects just fail).
+        self._eye_pool: list | None = None
+        self._jpeg_n = 0      # viewer JPEG encoded every 2nd eye frame
+        self._hover_thr = PHYS_HOVER_DEFAULT  # MEASURED at sim connect
+        self._hover_thr = PHYS_HOVER_DEFAULT  # MEASURED at sim connect
         # fixed-wing state
         self._wing_v = 15.0    # current airspeed (m/s)
         self._wing_roll = 0.0  # current bank (deg)
         self._last_wing_at = 0.0
-        self.lane = self.lane_from_throttle(BRAIN_HOVER)
-        self._lane_at = 0.0
         self.car_poses: list[tuple[float, float, float]] = []
         self._target_idx = 0        # which parked car is the current target
         self._car_pulses = 0        # approach pulses on the current target
         self._last_target_near = float("inf")
         self._near_car = float("inf")
         self._prox_val = 0.0
+        self._last_alt: float | None = None
         self._last_prox_t = 0.0
         # per-episode stats (reset in end_episode)
         self._ep_start = time.perf_counter()
@@ -277,6 +520,10 @@ class Bridge:
                     # takeoff runs a velocity climb)
                     self.cache_car_poses(client)
                     self.setup_vehicle(client)
+                    if args.eyes == "fly":
+                        self.apply_fly_cameras(client)
+                    if args.gfx:
+                        self.apply_low_gfx(client)
                     if args.airframe == "wing":
                         print(f"[wing] airframe=wing: throttle->airspeed, "
                               f"elevator->climb, aileron->banked turn; stall "
@@ -289,6 +536,26 @@ class Bridge:
                               f"a fresh 14-22 m approach", flush=True)
                     self._ep_origin = (self.spawn.x_val, self.spawn.y_val)
                     self._sim_ready = True
+                else:
+                    # Sim may have restarted while the bridge lived on: a
+                    # fresh sim resets cameras/quality/visibility. Detect
+                    # it cheaply via the fly-eye FOV and redo full setup.
+                    fresh = False
+                    try:
+                        fov = client.simGetCurrentFieldOfView("0", args.vehicle)
+                        fresh = (args.eyes == "fly"
+                                 and abs(fov - FLY_EYE_FOV_DEG) > 1.0)
+                    except Exception:
+                        pass
+                    if fresh:
+                        print("[airsim] fresh sim detected (camera FOV "
+                              f"{fov:.0f} != fly {FLY_EYE_FOV_DEG:.0f}); "
+                              "re-running setup", flush=True)
+                        self._sim_ready = False
+                        self._eye_pool = None   # workers ride the dead sim
+                        continue
+                    if args.eyes == "fly":
+                        self._hide_own_body(client)
                 print(f"[bridge] connecting to brain at {args.brain_ws}")
                 async with websockets.connect(
                         args.brain_ws, open_timeout=30, max_size=32 * 2**20) as ws:
@@ -309,6 +576,7 @@ class Bridge:
         try:
             names = [n for n in client.simListSceneObjects("[Cc]ar.*")
                      if CAR_NAME_RE.match(n)]
+            self.car_poses.clear()   # reconnects re-enter here; never dupe
             for name in names:
                 p = client.simGetObjectPose(name).position
                 self.car_poses.append((p.x_val, p.y_val, p.z_val))
@@ -317,6 +585,117 @@ class Bridge:
                   f"proximity reward disabled", flush=True)
         print(f"[airsim] tracking {len(self.car_poses)} parked cars "
               f"for proximity reward", flush=True)
+
+    def apply_fly_cameras(self, client) -> None:
+        """Re-point the sim's four fisheye captures into a wrap-around
+        compound-eye arrangement (two front, two rear, 130-deg facets).
+        Runs once per sim session; settings.json keeps a plain copy so
+        other clients are unaffected."""
+        fov = FLY_EYE_FOV_DEG
+        for name, yaw in zip(FLY_EYE_CAMS,
+                             (0.0, 180.0, -FLY_EYE_REAR_YAW,
+                              FLY_EYE_REAR_YAW)):
+            client.simSetCameraPose(name, airsim.Pose(
+                airsim.Vector3r(0.10, 0, 0),
+                airsim.to_quaternion(FLY_EYE_PITCH, 0.0, math.radians(yaw))))
+            try:
+                client.simSetCameraFov(name, fov, self.args.vehicle)
+            except Exception:
+                pass   # older builds: settings.json default (90) still works
+        print(f"[fly] compound-eye optics: 4 x {fov:.0f} deg facets "
+              f"(front pair + rear pair at +-{FLY_EYE_REAR_YAW:.0f} deg) "
+              f"-> wrap-around panorama", flush=True)
+        # the other vehicle parked at the spawn area is a pseudo-body
+        # staring into the rear facets — park it far from the training
+        # neighborhood
+        other = "Wing1" if self.args.vehicle != "Wing1" else "Fly1"
+        try:
+            op = client.simGetObjectPose(other)
+            op.position.x_val += 400.0
+            op.position.y_val += 400.0
+            client.simSetObjectPose(other, op, True)
+            print(f"[fly] parked {other} 400 m away (was in the eye view)",
+                  flush=True)
+        except Exception:
+            pass
+        self._hide_own_body(client)
+        self._probe_hover_throttle(client)
+    def apply_low_gfx(self, client) -> None:
+        """Drop the game's rendering cost so the eye rate rises. Measured on
+        the iGPU box: scalability floor 3.6 -> 8.3 captures/s (2.3x). Scene
+        captures ignore window resolution and r.ScreenPercentage (no gain
+        there), so only the quality floors are touched. Re-applied on every
+        sim (re)connect."""
+        for cmd in ("sg.ResolutionQuality 10", "sg.ShadowQuality 0",
+                    "sg.EffectsQuality 0", "sg.PostProcessQuality 0",
+                    "sg.TextureQuality 0", "sg.ViewDistanceQuality 0",
+                    "sg.AntiAliasingQuality 0", "r.VSync 0",
+                    "r.SSRQuality 0", "r.MotionBlurQuality 0",
+                    "r.BloomQuality 0", "r.AmbientOcclusionLevels 0",
+                    "t.IdleWhenNotForeground 0", "t.MaxFPS 0"):
+            try:
+                client.simRunConsoleCommand(cmd)
+            except Exception:
+                pass
+        print("[gfx] render floor applied (scalability mins, vsync off, "
+              "SSR/blur/bloom/AO off, no background throttle)", flush=True)
+
+    def _probe_hover_throttle(self, client) -> None:
+        """Measure the AIRCRAFT's hover throttle (an aircraft constant,
+        like its mass — not a brain statistic): hold a test throttle with
+        the low-level angle/throttle API and read the resulting climb rate.
+        Two points give the hover point by interpolation and the climb
+        slope sanity-checks VZ scaling. Falls back to PHYS_HOVER_DEFAULT
+        on any failure. Runs during sim setup, BEFORE the brain gets
+        control, so the flight controller's hover hold has settled."""
+        try:
+            client.enableApiControl(True, self.args.vehicle)
+            client.armDisarm(True, self.args.vehicle)
+            z0 = client.simGetGroundTruthKinematics(
+                self.args.vehicle).position.z_val
+            client.moveToZAsync(z0 - 8.0, 3.0, 12,
+                                airsim.YawMode(False, 0.0), -1, 1,
+                                self.args.vehicle).join()
+            probe = []
+            for thr in (0.50, 0.70):
+                client.moveByRollPitchYawrateThrottleAsync(
+                    0.0, 0.0, 0.0, thr, 1.6, self.args.vehicle)
+                time.sleep(1.6)
+                vz0 = client.simGetGroundTruthKinematics(
+                    self.args.vehicle).linear_velocity.z_val
+                client.moveByRollPitchYawrateThrottleAsync(
+                    0.0, 0.0, 0.0, thr, 1.4, self.args.vehicle)
+                time.sleep(1.4)
+                vz1 = client.simGetGroundTruthKinematics(
+                    self.args.vehicle).linear_velocity.z_val
+                probe.append((thr, -(vz0 + vz1) * 0.5))  # NED z -> up+
+            (t0, c0), (t1, c1) = probe
+            if c1 > c0:      # climbing with more throttle: sane physics
+                self._hover_thr = clamp(t0 + (0.0 - c0) * (t1 - t0) / (c1 - c0),
+                                        0.15, 0.75)
+            print(f"[fly] measured hover throttle {self._hover_thr:.3f} "
+                  f"(probe: thr .50 -> climb {c0:+.1f} m/s, thr .70 -> "
+                  f"climb {c1:+.1f} m/s)", flush=True)
+        except Exception as exc:
+            print(f"[fly] hover probe failed ({exc!r}); using fallback "
+                  f"{PHYS_HOVER_DEFAULT}", flush=True)
+            self._hover_thr = PHYS_HOVER_DEFAULT
+
+    def _hide_own_body(self, client) -> None:
+        """Hide this vehicle's pawn from every camera (--hide-body opt-in).
+        The rear fly facets would stare straight back at the drone body;
+        the off-boresight eye windows already exclude the rear hemisphere,
+        so the default keeps the pawn VISIBLE for the third-person chase
+        view. Uses the Unreal console ('ke <pawn> 0'); the vehicle stays
+        fully RPC-controllable while hidden. Pose resets can restore the
+        pawn, so this is re-run after every respawn."""
+        if not self.args.hide_body:
+            return
+        try:
+            client.simRunConsoleCommand(f"ke {self.args.vehicle} 0")
+        except Exception as exc:
+            print(f"[fly] body-hide failed ({exc!r}); rear facets may "
+                  f"see the drone body", flush=True)
 
     def setup_vehicle(self, client) -> None:
         client.enableApiControl(True, self.args.vehicle)
@@ -336,6 +715,8 @@ class Bridge:
         pose = client.simGetVehiclePose(self.args.vehicle)
         pose.position.z_val = self.args.ground_z - RESPAWN_ALT  # NED: up = -z
         client.simSetVehiclePose(pose, True, self.args.vehicle)
+        if self.args.eyes == "fly":
+            self._hide_own_body(client)   # pose sets re-show the pawn
         client.moveByVelocityBodyFrameAsync(
             0.0, 0.0, -2.0, 4.0,   # climb at 2 m/s for 4 s (NED: -vz = up)
             airsim.DrivetrainType.MaxDegreeOfFreedom,
@@ -460,27 +841,44 @@ class Bridge:
         self._near_car = math.sqrt(d2)
         if (self.args.cars and self.args.prox_gain > 0.0
                 and self._near_car <= self.args.prox_radius):
-            # near the training target: pure PROGRESS signal. Hovering and
-            # retreating send nothing (the brain's relative shaping treats
-            # silence as neutral); each 0.5 s tick that CLOSED distance
-            # pulses a small reward proportional to meters gained. This is
-            # the dense approach signal that leads to the +2.5 jackpot.
+            # near the training target: pure PROGRESS signal, measured in
+            # HORIZONTAL distance only — the approach task is XY, and using
+            # 3D distance let altitude bobbing (lane-tracking oscillation)
+            # register as closing/retreating every tick even at a dead
+            # hover. Hovering and retreating send nothing (the brain's
+            # relative shaping treats silence as neutral); each 0.5 s tick
+            # that closes at least --closing-min meters pulses a small
+            # reward proportional to meters gained. The minimum gate kills
+            # residual horizontal jitter drips.
+            d2h = min((p.x_val - x) ** 2 + (p.y_val - y) ** 2
+                      for x, y, _z in self.car_poses)
+            near_h = math.sqrt(d2h)
             if self._last_target_near == float("inf"):
                 pass                        # first reading: baseline only
-            elif self._near_car < self._last_target_near:
-                gained = self._last_target_near - self._near_car
+            elif self._last_target_near - near_h >= self.args.closing_min:
+                gained = self._last_target_near - near_h
                 v = min(self.args.closing_gain * gained, 0.5)
                 self._car_pulses += 1
                 self._prox_val = v
                 await ws.send(json.dumps(
                     {"type": "reward", "value": round(v, 3)}))
-            self._last_target_near = self._near_car
+            self._last_target_near = near_h
             return
         v = self.args.prox_gain * (
             self.args.prox_max
             * clamp(1.0 - self._near_car / self.args.prox_radius, 0.0, 1.0)
             + self.args.near_max
             * clamp(1.0 - self._near_car / self.args.near_radius, 0.0, 1.0))
+        # altitude-band shaping: a grounded drone is outside the task (the
+        # targets are street-level cars), and with absolute throttle the
+        # untrained pool starts LOW — without this signal, punishment for
+        # terrain hits would only depress the throttle pool further (a
+        # punishment spiral). Sustained flight in the band earns a small
+        # continuous reward: a training signal for the throttle pool, NOT
+        # a controller — the brain still owns throttle entirely.
+        if self._last_alt is not None:
+            band = clamp(1.0 - abs(self._last_alt - 8.0) / 8.0, 0.0, 1.0)
+            v += self.args.alt_gain * band
         self._prox_val = v
         if v > 0.0:
             await ws.send(json.dumps({"type": "reward", "value": round(v, 3)}))
@@ -496,10 +894,11 @@ class Bridge:
     async def flight_loop(self, client, ws) -> None:
         args = self.args
         self._ws_ref = ws
-        send_dt = 1.0 / args.vision_hz
+        send_dt = (1.0 / args.vision_hz) if args.vision_hz > 0 else 0.0
         next_send = 0.0
-        print(f"[bridge] streaming eyes at {args.vision_hz} Hz; "
-              f"assist={'off' if args.no_assist else 'on'}; reward={args.reward}")
+        print(f"[bridge] streaming eyes (cap {args.vision_hz or 'uncapped'} Hz; "
+              f"sim-paced on this machine); "
+              f"assist={'off' if args.no_assist else 'on'}")
 
         reader = asyncio.create_task(self.reader_loop(ws))
         try:
@@ -508,8 +907,19 @@ class Bridge:
 
                 # stream the eye pair + body state
                 if now >= next_send:
-                    next_send = now + send_dt
+                    t_vision = now
                     await self.sense_and_stream(client, ws)
+                    # vision-hz is a CAP: never add a sleep on top of
+                    # capture time. On slow sims the capture IS the
+                    # pacing; measure the achieved rate for the HUD.
+                    dt_v = time.perf_counter() - t_vision
+                    if dt_v > 0:
+                        hz = 1.0 / dt_v
+                        self._vision_hz_ema = (
+                            hz if self._vision_hz_ema == 0.0
+                            else 0.8 * self._vision_hz_ema + 0.2 * hz)
+                    next_send = ((t_vision + send_dt)
+                                 if send_dt > 0 else 0.0)
 
                 # periodic control / telemetry / status
                 self.apply_command(client, now)
@@ -533,7 +943,10 @@ class Bridge:
                     self._ep_near_min = min(self._ep_near_min, self._near_car)
                 self._ep_dopa_sum += self.dopa
                 self._ep_dopa_n += 1
-                await self.maybe_reward(client, ws, now)
+                if (self.args.eyes == "fly"
+                        and now - self._last_hide_assert > 5.0):
+                    self._last_hide_assert = now
+                    self._hide_own_body(client)   # pose sets re-show it
                 if now - self._last_tel_req > 1.0:
                     self._last_tel_req = now
                     await ws.send(json.dumps({"type": "telemetry"}))
@@ -562,17 +975,21 @@ class Bridge:
         self.track_collision(client, col)
         kin = client.simGetGroundTruthKinematics(self.args.vehicle)
         alt = -kin.position.z_val                    # NED z is down
+        self._last_alt = alt
         vy_up = -kin.linear_velocity.z_val
         speed = math.sqrt(kin.linear_velocity.x_val ** 2
                           + kin.linear_velocity.y_val ** 2
                           + kin.linear_velocity.z_val ** 2)
         collided = bool(col.has_collided)
 
-        if self.args.eyes == "stereo":
+        if self.args.eyes == "fly":
+            frames, pano = self.fly_eye_frames(client)
+            self._hud_vision = pano
+        elif self.args.eyes == "stereo":
             requests = [airsim.ImageRequest("0", airsim.ImageType.Scene, False, False),
                         airsim.ImageRequest("1", airsim.ImageType.Scene, False, False)]
             resps = client.simGetImages(requests)
-            frames = [pack_eye_frame(eye, rgb)
+            frames = [pack_eye_frame(eye, self._to_retina(rgb))
                       for eye, resp in enumerate(resps)
                       if (rgb := self.rgb_from_response(resp)) is not None]
         else:
@@ -581,7 +998,8 @@ class Bridge:
             resp = client.simGetImages(
                 [airsim.ImageRequest("2", airsim.ImageType.Scene, False, False)])[0]
             rgb = self.rgb_from_response(resp)
-            frames = ([pack_eye_frame(0, rgb), pack_eye_frame(1, rgb)]
+            frames = ([pack_eye_frame(0, self._to_retina(rgb)),
+                       pack_eye_frame(1, self._to_retina(rgb))]
                       if rgb is not None else [])
         if len(frames) == 2:
             for f in frames:
@@ -594,16 +1012,111 @@ class Bridge:
                 "collision": collided,
             }))
 
+    def _new_rpc_client(self):
+        """A fresh RPC connection to the sim (parallel eye pool uses one
+        per camera; see _fetch_rgb_parallel)."""
+        return airsim.MultirotorClient(ip=self.args.airsim_ip,
+                                       port=self.args.airsim_port)
+
+    def _fetch_rgb_parallel(self) -> list[np.ndarray | None]:
+        """Fetch one frame per eye camera CONCURRENTLY (a dedicated
+        connection + worker thread per camera). Returns RGBs in
+        FLY_EYE_CAMS order (None for a camera that failed).
+
+        The bridge is async; these calls are BLOCKING, so the workers are
+        background daemon threads with the latest result dropped into a
+        slot — the event loop never waits on a capture."""
+        if self._eye_pool is None:
+            pool = []
+            for name in FLY_EYE_CAMS:
+                c = self._new_rpc_client()
+                c.confirmConnection()
+                req = [airsim.ImageRequest(
+                    name, airsim.ImageType.Scene, False, False)]
+                out: dict = {"rgb": None}
+                ev = threading.Event()
+                th = threading.Thread(
+                    target=self._eye_worker, args=(c, req, out, ev),
+                    daemon=True)
+                th.start()
+                pool.append((out, ev))
+            self._eye_pool = pool
+        for out, ev in self._eye_pool:
+            ev.set()                      # request a fresh capture
+        time.sleep(0.004)                 # workers run; loop stays async
+        with self._fly_state_lock:
+            return [out["rgb"] for out, _ in self._eye_pool]
+
+    @staticmethod
+    def _eye_worker(c, req, out: dict, ev: threading.Event) -> None:
+        """Dedicated capture thread: one camera, one connection, forever
+        (until the sim dies, which raises and quietly ends the thread; the
+        pool is rebuilt on the next reconnect)."""
+        while True:
+            ev.wait()
+            ev.clear()
+            try:
+                resp = c.simGetImages(req)[0]
+                data = bytes(resp.image_data_uint8)
+                n = resp.width * resp.height
+                rgb = (np.frombuffer(data[:n * 3], dtype=np.uint8)
+                       .reshape(resp.height, resp.width, 3)
+                       if len(data) >= n * 3 else None)
+                out["rgb"] = rgb          # atomic ref swap under the GIL
+            except Exception:
+                time.sleep(0.05)          # sim gone: idle until rebuilt
+
+    def fly_eye_frames(self, client) -> tuple[list[bytes], np.ndarray]:
+        """Fetch the four wrap-around captures, build the panorama, run
+        the full fly-optics pipeline per eye, and return (packed retina
+        frames for the brain, panorama for the viewer)."""
+        rgbs = self._fetch_rgb_parallel()
+        pano = _fly_wrap(rgbs)
+        left = fly_eye_left(pano)
+        right = fly_eye_right(pano)
+        # viewer JPEG: retinas on top, raw panorama below
+        lw = left.shape[1]
+        top = np.concatenate([left, right], axis=1)
+        cv2.putText(top, "LEFT EYE", (4, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
+        cv2.putText(top, "RIGHT EYE", (lw + 4, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 1)
+        pano_bgr = cv2.cvtColor(pano, cv2.COLOR_RGB2BGR)
+        pano_bgr = cv2.resize(pano_bgr, (top.shape[1], 120),
+                              interpolation=cv2.INTER_AREA)
+        self._jpeg_n += 1
+        if self._jpeg_n % 2 == 0:         # viewer needs ~25 fps, not 60:
+            vis = np.concatenate([        # skip alternate encodes
+                cv2.cvtColor(top, cv2.COLOR_GRAY2BGR), pano_bgr], axis=0)
+            ok, buf = cv2.imencode(".jpg", vis,
+                                   [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                with self._fly_state_lock:
+                    self._fly_jpeg = buf.tobytes()
+        return [pack_eye_frame(0, np.repeat(left[:, :, None], 3, axis=2)),
+                pack_eye_frame(1, np.repeat(right[:, :, None], 3, axis=2))], pano
+
     @staticmethod
     def rgb_from_response(resp) -> np.ndarray | None:
+        """Native-size RGB capture (dimensions come from the response; the
+        callers decide whether to keep them for supersampled optics or
+        resize to the retina for the plain modes)."""
         data = bytes(resp.image_data_uint8)
         if not data:
             return None
         n = resp.width * resp.height
         if len(data) >= n * 3:
-            arr = np.frombuffer(data[:n * 3], dtype=np.uint8)
-            return arr.reshape(H, W, 3)
+            return np.frombuffer(data[:n * 3], dtype=np.uint8).reshape(
+                resp.height, resp.width, 3)
         return None
+
+    @staticmethod
+    def _to_retina(rgb: np.ndarray) -> np.ndarray:
+        """Resize any capture to the exact (H, W, 3) retina frame the
+        plain (stereo/center) eye modes pack."""
+        if rgb.shape[:2] != (H, W):
+            rgb = cv2.resize(rgb, (W, H), interpolation=cv2.INTER_AREA)
+        return rgb
 
     def track_collision(self, client, col) -> None:
         """Collision event -> punish OR reward (car), then respawn.
@@ -693,6 +1206,8 @@ class Bridge:
             pose.position.z_val = self.args.ground_z - spawn_alt  # NED: up = -z
             pose.orientation = airsim.Quaternionr(0.0, 0.0, 0.0, 1.0)  # level, initial heading
         client.simSetVehiclePose(pose, True, self.args.vehicle)
+        if self.args.eyes == "fly":
+            self._hide_own_body(client)   # pose reset can restore the pawn
         self._ep_origin = (pose.position.x_val, pose.position.y_val)
         if self.args.airframe == "wing":
             # catapult launch: airborne at cruise speed, level wings
@@ -706,11 +1221,14 @@ class Bridge:
             )
         # kill any stale brain stick bias so the fresh episode starts calm
         self.cmd = {"throttle": BRAIN_HOVER, "pitch": 0.0, "roll": 0.0, "yaw": 0.0}
+        self.trim = {"pitch": None, "roll": None, "yaw": None}
+        self._trim_at = 0.0
+        self._trim_samples: list[tuple[float, dict[str, float]]] = []
+        self._trim_windows = 0
         self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
         self._ceil_since = 0.0
         self._last_target_near = float("inf")   # fresh approach baseline
         self._car_pulses = 0
-        self.lane = self.lane_from_throttle(BRAIN_HOVER)
         client.moveByVelocityBodyFrameAsync(
             0.0, 0.0, -1.5, 1.0,
             airsim.DrivetrainType.MaxDegreeOfFreedom,
@@ -771,43 +1289,93 @@ class Bridge:
             self.args.vehicle,
         )
 
-    def lane_from_throttle(self, throttle: float) -> float:
-        """Throttle -> target altitude. RC expo curve (LANE_EXPO): the low
-        half of the throttle range is compressed toward the floor, so the
-        brain's small down-dips actually select street-level lanes where the
-        cars are — without that, a high-lane cruising brain can never touch
-        one (episode 1: 41 collisions, 0 car touches)."""
-        frac = expo(clamp(throttle, 0.0, 1.0), LANE_EXPO)
-        return self.args.min_alt + frac * (self.args.max_alt - self.args.min_alt)
-
     def compute_sticks(self, now: float) -> dict[str, float]:
-        """Brain channels -> RC sticks, with real FPV feel:
-        - the throttle stick is NORMALIZED around BRAIN_HOVER: hover-scaled
-          down deflections get the same authority as up deflections (the old
-          raw mapping capped down-sticks at hover of the up range, so the
-          drone could climb but never genuinely descend);
-        - --stick-gain amplifies the brain's small channel wiggles;
-        - a first-order low-pass (--stick-tau) gives the stick real inertia,
-          so brief channel dips integrate into actual stick deflections the
-          flight controller can act on, instead of being averaged away."""
+        """Brain channels -> RC sticks. IDENTICAL rule on every axis:
+        trimmed center -> deadband -> gain -> low-pass. No per-axis
+        special cases anywhere; the brain's commands are the control."""
         c = self.cmd
         gain = self.args.stick_gain
-        d = clamp(c["throttle"], 0.0, 1.0) - BRAIN_HOVER
-        t = d / (1.0 - BRAIN_HOVER) if d >= 0.0 else d / BRAIN_HOVER
+
+        def centered(name: str) -> float:
+            """Channel value relative to its trim center, deadbanded."""
+            trim = self.trim.get(name)
+            if trim is None:
+                return 0.0          # no trim yet: never act on raw bias
+            d = clamp(c[name], -1.0, 1.0) - trim
+            if abs(d) < self.args.deadband:
+                return 0.0
+            return d
+
+        # climb: throttle is the brain's ABSOLUTE output. Zero throttle
+        # means zero throttle — the aircraft sinks at its physical rate.
+        # The MEASURED hover point (aircraft constant, probed at sim
+        # connect) is where climb demand crosses zero; above it climbs,
+        # below it descends. Nothing about the brain's resting statistics
+        # is subtracted, so holding altitude is learned, not trimmed in.
+        thr = clamp(c["throttle"], 0.0, 1.0)
+        hover = self._hover_thr
+        k_up = VZ_MAX / (1.0 - hover)     # full stick up == +VZ_MAX
+        climb = (thr - hover) * k_up
         raw = {
-            "fwd":   clamp(-c["pitch"] * gain, -1.0, 1.0) * V_FWD_MAX,
-            "lat":   clamp(c["roll"] * gain, -1.0, 1.0) * V_LAT_MAX,
-            "climb": clamp(t * gain, -1.0, 1.0) * VZ_MAX,
-            "yaw":   -clamp(c["yaw"] * gain, -1.0, 1.0) * YAW_RATE_MAX,
+            "fwd":   clamp(-centered("pitch") * gain, -1.0, 1.0) * V_FWD_MAX,
+            "lat":   clamp(centered("roll") * gain, -1.0, 1.0) * V_LAT_MAX,
+            "climb": clamp(climb, -VZ_MAX, VZ_MAX),
+            "yaw":   -clamp(centered("yaw") * gain, -1.0, 1.0) * YAW_RATE_MAX,
         }
         dt = now - self._stick_at
         self._stick_at = now
         if dt <= 0.0:
             return self.stick
-        a = 1.0 if self.args.stick_tau <= 0 else min(1.0, dt / self.args.stick_tau)
         for k, tgt in raw.items():
+            a = 1.0 if self.args.stick_tau <= 0                 else min(1.0, dt / self.args.stick_tau)
             self.stick[k] += (tgt - self.stick[k]) * a
         return self.stick
+
+    def update_trim(self) -> None:
+        """Calibrate each attitude channel's resting value ONCE per episode
+        (RC transmitter trim, frozen after arming).
+
+        For the first TRIM_SAMPLE_S of an episode we collect resting samples
+        and take the median as the center; from then on the trim is FROZEN.
+        This is the crucial property: a continuous adaptive trim absorbs
+        sustained channel offsets, but flight COMMANDS *are* sustained
+        offsets — an adaptive trim ate them (the drone could only spin and
+        change altitude). A frozen center makes deflections meaningful for
+        the whole episode and is re-derived fresh at every respawn, so it
+        always tracks the circuit's current resting state.
+        """
+        now = time.perf_counter()
+        if self.in_stun() or not self.got_actions:
+            return
+        if self.trim["pitch"] is not None:
+            return                        # calibrated this episode: frozen
+        self._trim_samples.append(
+            (now, {k: clamp(self.cmd[k], -1.0, 1.0)
+                   for k in ("pitch", "roll", "yaw")}))
+        t0 = self._trim_samples[0][0]
+        if now - t0 < TRIM_SAMPLE_S:
+            return                        # still sampling
+        # reject an ACTIVE window: if any channel moved (stdev over the
+        # window) the brain was commanding, and its median would freeze a
+        # command in as the center — discard and resample. After a few
+        # failed windows, accept anyway (a biased-but-stable center still
+        # beats never calibrating; the next respawn retries).
+        active = any(
+            _stdev([s[1][k] for s in self._trim_samples]) > TRIM_QUIET_STDEV
+            for k in ("pitch", "roll", "yaw"))
+        if active and self._trim_windows < TRIM_MAX_WINDOWS:
+            self._trim_windows += 1
+            self._trim_samples = []
+            return
+        for name in ("pitch", "roll", "yaw"):
+            vals = sorted(s[1][name] for s in self._trim_samples)
+            self.trim[name] = vals[len(vals) // 2]
+        self._trim_samples = []
+        print(f"[trim] calibrated (frozen for episode): "
+              f"pitch {self.trim['pitch']:+.3f} "
+              f"roll {self.trim['roll']:+.3f} "
+              f"yaw {self.trim['yaw']:+.3f}  |  phys hover "
+              f"{self._hover_thr:.3f}", flush=True)
 
     def apply_command(self, client, now: float) -> None:
         """FPV joystick scheme. fwd/lat/yaw are amplified, low-passed rate
@@ -843,19 +1411,7 @@ class Bridge:
             # punished and the crash view stays put for the retina
             self.stick = {"fwd": 0.0, "lat": 0.0, "climb": 0.0, "yaw": 0.0}
             s = self.stick
-        elif self.args.control == "lane" and not self.args.no_assist:
-            kin = client.simGetGroundTruthKinematics(self.args.vehicle)
-            alt = -kin.position.z_val
-            # the selected lane glides RC-style, then the controller chases it
-            lane_t = self.lane_from_throttle(self.cmd["throttle"])
-            dt = clamp(now - self._lane_at, 0.001, 0.2) if self._lane_at else 0.05
-            self._lane_at = now
-            a = (1.0 if self.args.stick_tau <= 0
-                 else min(1.0, dt / self.args.stick_tau))
-            self.lane += (lane_t - self.lane) * a
-            climb = clamp(ALT_P_GAIN * (self.lane - alt), -VZ_MAX, VZ_MAX)
-            if alt < 0.8:                       # never burrow into the ground
-                climb = max(climb, 2.0)
+            climb = 0.0
         else:
             climb = s["climb"]
             if not self.args.no_assist:
@@ -863,7 +1419,7 @@ class Bridge:
                 # rate within 1 m of an edge and FULLY overrides past it
                 kin = client.simGetGroundTruthKinematics(self.args.vehicle)
                 alt = -kin.position.z_val
-                over = (self.args.min_alt + 1.0) - alt
+                over = (self.args.min_alt + 3.0) - alt
                 if over > 0.0:                  # floor: blend to +2 m/s climb
                     f = clamp(over, 0.0, 1.0)
                     climb = climb * (1.0 - f) + 2.0 * f
@@ -872,11 +1428,25 @@ class Bridge:
                     f = clamp(over, 0.0, 1.0)
                     climb = climb * (1.0 - f) - 0.8 * f
         self._hud = (s["fwd"], s["lat"], s["climb"], s["yaw"])
-        # NED: vz is down-positive, so pass -climb
+        # NED: vz is down-positive, so pass -climb. Yaw: tiny demand =
+        # heading hold (YawMode is_rate=False damps rotation), like a real
+        # quad's heading-hold mode; otherwise a rate command.
+        yaw_mode = (abs(s["yaw"]) >= YAW_HOLD_EPS)
+        # BRAIN-ONLY ACTUATION (no hard-coded behavior): the connectome's
+        # four channels are the ONLY flight commands. Yaw follows the same
+        # stick rule as every other axis — centered = heading hold
+        # (YawMode is_rate=False), deflected = yaw RATE. The former
+        # exploration wind / nose-chase injected actuator commands the
+        # brain never made (the repeated spin-in-place was exactly that,
+        # bridge-side, not the circuit) — gone. Reward/punish signals
+        # (car curriculum, collision punish, stagnation pressure) are
+        # TRAINING signals, not actuator control, and remain.
         client.moveByVelocityBodyFrameAsync(
-            s["fwd"], s["lat"], -climb, CMD_HOLD_S + self.CMD_PERIOD_S,
+            s["fwd"],
+            s["lat"],
+            -climb, CMD_HOLD_S + self.CMD_PERIOD_S,
             airsim.DrivetrainType.MaxDegreeOfFreedom,
-            airsim.YawMode(True, s["yaw"]),
+            airsim.YawMode(abs(s["yaw"]) >= YAW_HOLD_EPS, s["yaw"]),
             self.args.vehicle,
         )
 
@@ -888,6 +1458,7 @@ class Bridge:
                 self.cmd["pitch"] = float(action.get("pitch", 0.0))
                 self.cmd["roll"] = float(action.get("roll", 0.0))
                 self.cmd["yaw"] = float(action.get("yaw", 0.0))
+                self.update_trim()
             return
         try:
             obj = json.loads(msg)
@@ -899,23 +1470,6 @@ class Bridge:
             self.learning = bool(obj.get("learning", False))
 
     # ---- reward shaping (optional) ----------------------------------------
-    async def maybe_reward(self, client, ws, now: float) -> None:
-        if not self.args.reward:
-            return
-        if self.in_stun():
-            return    # keep the event window clean of shaping pulses
-        if now - self._last_reward_t < 0.5:
-            return
-        self._last_reward_t = now
-        kin = client.simGetGroundTruthKinematics(self.args.vehicle)
-        alt = -kin.position.z_val
-        speed = math.hypot(kin.linear_velocity.x_val, kin.linear_velocity.y_val)
-        self._reward_prog += (speed - self._reward_prog) * 0.05
-        v = 0.6 * clamp((alt - 4.0) / 4.0, -1.0, 1.0) \
-            + 0.4 * clamp((speed - self._reward_prog) / max(self._reward_prog, 0.5),
-                          -1.0, 1.0)
-        await ws.send(json.dumps({"type": "reward", "value": round(v, 3)}))
-
     async def send_reward_now(self, value: float) -> None:
         ws = getattr(self, "_ws_ref", None)
         if ws is not None:
@@ -941,14 +1495,14 @@ class Bridge:
         wing = (f"v {self._wing_v:4.1f} m/s bank {self._wing_roll:+5.1f} deg  "
                 if self.args.airframe == "wing" else "")
         print(f"[{'wing' if self.args.airframe == 'wing' else 'fly'}] "
-              f"alt {alt:5.1f} m  lane {self.lane:5.1f} m  "
+              f"alt {alt:5.1f} m  "
               f"spd {speed:4.1f} m/s  {wing}"
               f"sticks fwd {sticks[0]:+5.1f} lat {sticks[1]:+5.1f} "
               f"vz {sticks[2]:+5.1f} m/s yaw {sticks[3]:+6.1f} deg/s  "
               f"hits {self.collision_count}  cars {self.car_bumps}  "
               f"near {self._near_car:5.1f} m  min {self._ep_near_min:4.1f} m  "
               f"pulses {self._car_pulses:3d}  prox {self._prox_val:+.2f}  "
-              f"dopa {self.dopa:+.3f} "
+              f"dopa {self.dopa:+.3f} eyes {self._vision_hz_ema:4.1f}/s "
               f"learn {'on' if self.learning else 'off'}  "
               f"sim {sim_ms:.1f} ms  act {stale*1000:.0f} ms ago", flush=True)
 
@@ -960,14 +1514,32 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--airsim-port", type=int, default=41451)
     ap.add_argument("--vehicle", default="Fly1")
     ap.add_argument("--vision-hz", type=int, default=DEFAULT_VISION_HZ,
-                    help="eye streaming rate (web client uses 120)")
-    ap.add_argument("--eyes", choices=["center", "stereo"], default="center",
-                    help="center: one forward camera to both eyes; "
-                         "stereo: +-35 deg left/right pair")
-    ap.add_argument("--min-alt", type=float, default=1.0,
-                    help="ground safety band lower edge (m); below car-roof "
-                         "height (~1.5 m) so car touches are possible")
-    ap.add_argument("--max-alt", type=float, default=30.0,
+                    help="eye-rate CAP; 0 (default) = stream as fast as the "
+                         "sim renders (capture latency dominates on slow "
+                         "machines; an artificial sleep is never added)")
+    ap.add_argument("--eyes", choices=["center", "stereo", "fly"],
+                    default="fly",
+                    help="fly (default): wrap-around compound-eye optics "
+                         "with ommatidial blur, green-weighted photoreceptors "
+                         "and a phasic motion channel, one hemisphere per "
+                         "eye; stereo: +-35 deg camera pair; center: one "
+                         "forward camera to both eyes")
+    ap.add_argument("--no-gfx", dest="gfx", action="store_false",
+                    default=True,
+                    help="drop the game's rendering quality so the sim "
+                         "renders faster and the eyes stream faster "
+                         "(--no-gfx to keep stock visuals)")
+    ap.add_argument("--hide-body", action="store_true",
+                    help="hide the drone's own mesh from every camera "
+                         "(Unreal 'ke <pawn> 0'); default keeps it visible "
+                         "for the third-person chase view")
+    ap.add_argument("--viewer-port", type=int, default=FLY_VIEWER_PORT,
+                    help="fly-vision viewer HTTP port (0 disables; "
+                         "http://localhost:8795)")
+    ap.add_argument("--min-alt", type=float, default=0.0,
+                    help="ground safety band lower edge (m); 0 = ground "
+                         "level (the <0.8 m climb-out guard still applies)")
+    ap.add_argument("--max-alt", type=float, default=60.0,
                     help="ceiling safety band upper edge (m); the wing gets "
                          "+5 m and 3x the ride tolerance automatically")
     ap.add_argument("--airframe", choices=["quad", "wing"], default="quad",
@@ -978,9 +1550,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="sensitivity multiplier on every stick (pre-clamp)")
     ap.add_argument("--stick-tau", type=float, default=STICK_TAU_S,
                     help="RC stick inertia time constant (s); 0 = raw sticks")
-    ap.add_argument("--control", choices=["lane", "rate"], default="lane",
-                    help="lane: throttle selects a target altitude (position "
-                         "control); rate: climb-rate stick (legacy)")
+    ap.add_argument("--deadband", type=float, default=STICK_DEADBAND,
+                    help="attitude-channel deadband around trim (stick "
+                         "units) — jitter inside it commands nothing")
+    ap.add_argument("--no-trim", action="store_true",
+                    help="disable auto-trim (treat channel 0 as center, "
+                         "the old always-drifting behavior)")
     ap.add_argument("--ceil-ride", type=float, default=CEILING_RIDE_S,
                     help="seconds riding the ceiling before punish+respawn")
     ap.add_argument("--border-radius", type=float, default=BORDER_RADIUS_M,
@@ -989,6 +1564,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="world-frame z of the ground plane at the spawn area")
     ap.add_argument("--prox-gain", type=float, default=1.0,
                     help="proximity-reward gain (0 disables the shaping)")
+    ap.add_argument("--alt-gain", type=float, default=0.15,
+                    help="continuous reward for airborne flight in the "
+                         "0-16 m band (peak at 8 m; trains the throttle "
+                         "pool that staying aloft pays; 0 disables)")
     ap.add_argument("--prox-radius", type=float, default=40.0,
                     help="nearest-car distance beyond which prox reward is 0 (m)")
     ap.add_argument("--prox-max", type=float, default=0.5,
@@ -1004,6 +1583,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--closing-gain", type=float, default=0.1,
                     help="cars mode: reward per meter closed toward the "
                          "target car (capped at 0.5 per pulse)")
+    ap.add_argument("--closing-min", type=float, default=0.10,
+                    help="cars mode: minimum meters closed per 0.5 s tick "
+                         "for a closing pulse (jitter gate — a hover must "
+                         "stay silent)")
     ap.add_argument("--no-assist", action="store_true",
                     help="apply raw brain channels, no altitude hold")
     ap.add_argument("--punish-mag", type=float, default=PUNISH_MAG_DEFAULT,
@@ -1020,14 +1603,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--stun-max", type=float, default=STUN_MAX_S,
                     help="hard cap on the scene hold even if dopa has not "
                          "recovered (s)")
-    ap.add_argument("--reward", choices=["alt"], default=None,
-                    help="optional additional reward shaping (altitude+progress)")
     return ap.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     bridge = Bridge(args)
+    start_fly_viewer(bridge, args.viewer_port if args.eyes == "fly" else 0)
     try:
         return asyncio.run(bridge.run())
     except KeyboardInterrupt:

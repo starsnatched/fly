@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>fly vision</title>
+<style>
+  body{background:#0c0f0c;color:#9f9;font-family:ui-monospace,Consolas,monospace;margin:16px}
+  h3{margin:4px 0}
+  img{image-rendering:pixelated;width:768px;max-width:96vw;border:1px solid #2a3a2a;border-radius:6px}
+  p{color:#5f7f5f;max-width:768px}
+  #err{color:#d66}
+</style>
+</head>
+<body>
+<h3>what the fly brain sees</h3>
+<img id="f" alt="fly vision">
+<p id="err"></p>
+<p>top: the two retinas after full fly-vision processing (300-deg wrap-around
+windows centered 30 deg off boresight, ommatidial optics, green-weighted
+photoreceptors, phasic motion channel) &mdash; LEFT EYE | RIGHT EYE, each the
+exact 192x108 frame streamed to the connectome. bottom: the raw wrap-around
+panorama before the optics.</p>
+<script>
+function tick(){
+  const img = document.getElementById('f');
+  const err = document.getElementById('err');
+  img.onerror = () => { err.textContent = 'bridge not reachable yet - retrying...'; };
+  img.onload  = () => { err.textContent = ''; };
+  img.src = 'http://localhost:8795/frame?t=' + Date.now();
+}
+setInterval(tick, 66);
+tick();
+</script>
+</body>
+</html>

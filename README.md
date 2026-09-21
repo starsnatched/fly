@@ -97,13 +97,74 @@ flight controller does all prop mixing and attitude stabilization:
 |---|---|---|
 | `pitch` | forward/backward body velocity | ±12 m/s |
 | `roll` | left/right body velocity | ±9 m/s |
-| `throttle` | **altitude lane selector** (position control, expo curve) | 1–30 m lane |
+| `throttle` | **altitude lane selector** (position control, expo curve) | ground–60 m lane |
 | `yaw` | yaw rate | ±200°/s |
 
-Sticks get real FPV feel: `--stick-gain` (default 2.0) amplifies the brain's
+Sticks get real FPV feel: `--stick-gain` (default 3.0) amplifies the brain's
 small channel wiggles into full deflections, and `--stick-tau` (default 0.15 s)
 gives each stick RC-style inertia so sustained channel output integrates into
-motion. Altitude is **position control** (`--control lane`, default): the
+motion.
+
+**Auto-trim — why the quad can now actually hover.** The brain's motor
+channels are *potentials*, not centered sticks: the untrained circuit rests
+with a standing bias on pitch/roll/yaw (it wanders: −0.31 → −0.35 across
+episodes), so the naive mapping (raw channel = stick deflection) meant the
+drone always crept forward, spun, and drifted — it could never sit still.
+At every respawn the bridge calibrates each attitude channel's **resting
+value** (1.5 s median of quiet samples; active windows are rejected and
+resampled) and then **freezes** the trim for the whole episode. Frozen is
+the crucial property: a continuous adaptive trim absorbs sustained channel
+offsets — but flight *commands are* sustained offsets, and an adaptive trim
+ate them (the drone could only spin and change altitude). Deflections from
+the frozen center are real stick input for the entire episode: forward,
+backward, lateral, climb, spin all work; a resting brain = centered sticks =
+true hover. `--no-trim` restores the old raw mapping.
+
+The **yaw stick** is special-cased, because the untrained circuit's yaw
+channel swings ±0.2–0.35 stick at ~0.3 Hz — too slow for any usable
+low-pass to remove. The stick is smoothed at τ=2 s, then gated by an RC-style
+deadzone on the *smoothed* value (zero below 0.3 stick, full authority by
+0.5), and demand under 40°/s commands **heading hold** (`YawMode` rate off)
+instead of a rate — so the nose sits rock-still exactly like a real quad in
+heading-hold mode, while genuine sustained spin intent still turns it.
+
+**Stagnation pressure.** A collapsed policy that never deflects anything
+(park the quad, bob in place) generates no events, no gradients, no
+learning — refusal must cost. If the quad covers less than
+`--stagnate-disp` (1.5 m) of net XY ground in `--stagnate-s` (45 s), that's
+punished like a collision (`-punish-mag`, scene held for the dopamine tail)
+and respawned. Measured as net horizontal displacement, not speed: the lane
+controller's ±2 m/s vertical bobbing would defeat any speed threshold while
+the drone goes exactly nowhere. Brief hovers never trigger it.
+
+**Motor babble — the carrot that makes it fly.** The brain is *reactive*,
+not exploratory: it has no action sampler, and a parked drone staring at a
+static scene produces no retinal change → no sensory drive → motor pools at
+rest → no movement. A degenerate fixed point (up/down still worked only
+because lane control is position control — the P-controller flies any
+throttle number without the brain commanding it). The bridge therefore
+injects a course-following "exploration wind": a persistent course whose
+turn-rate random-walks (up to 120°/s, hard-turn-biased sampling, 25% of
+retargets hold straight) on a ~4.5 s clock, cruised at 4–9 m/s — FPV-fast,with a 150°/s nose-chase so
+the camera whips through turns without pirouetting faster than the drone
+flies. A yaw-rate wind chases the nose onto
+the course, so flight reads as **forward cruise with real turns** when the
+course changes, and the camera looks where it flies. Only the forward part
+of the wind enters the body-frame velocity — an earlier version injected
+lateral wind too, which turned every course change into sideways crabbing
+(the drone seemed to only strafe). The brain's own commands ADD to the
+wind, and inside 15 m of the target car the wind yields to 35% so the
+brain owns the close-in game (wind yields to 60% there — 35% made close-in
+forward slower than the vertical controller and the drone crawled exactly
+where the game happens) (`--no-dither` disables). As the carrot side:
+sustained horizontal cruise outside the near zone earns a small periodic
+pulse (+0.05 every 2 s) — moving must pay before any approach gradient can
+be discovered. Together with the stagnation punish
+this keeps the drone in the regime where optic flow, collisions, proximity
+pulses and the car jackpot all actually occur — the event stream R-STDP
+learns from.
+
+Altitude is **position control** (`--control lane`, default): the
 throttle channel selects a target altitude lane between `--min-alt` and
 `--max-alt` and a P controller flies there. A rate-mode climb stick
 (`--control rate`) is available, but the untrained throttle bias kept it
@@ -112,13 +173,77 @@ higher lane, and ceiling punishments map onto the throttle values that chose
 them (clean credit assignment for R-STDP). The lane curve uses an RC expo
 (`LANE_EXPO` 0.6): the low half of the throttle range is compressed toward
 the floor, so small throttle dips select street-level lanes — throttle 0.29
-(hover) sits at 4.8 m, 0.10 at 2.2 m, 0.0 at 1 m, where the parked cars are.
+(hover) sits near 7 m, ~0.20 dips to street level, 0.0 reaches the ground
+lane where the parked cars are.
 
-Vision defaults to the **forward center camera streamed to both eyes** (the
-retina's two hemispheres each read half the image); `--eyes stereo` switches to
-the ±35° left/right pair. The brain's throttle fully owns altitude; a safety
-band only pushes back within ~1 m of `--min-alt` (1.0 m — below car-roof
-height, so car touches are physically possible) / `--max-alt` (30 m).
+Vision defaults to **fly vision** (`--eyes fly`): the drone is fitted with a
+wrap-around compound eye — four 130° facets (front pair + rear pair at
+±115°) stitched into a 360°×120° panorama, and each eye samples a
+**240°-wide window centered 30° off boresight** (left eye left, right eye
+right): the pair covers ~300° with true stereo overlap, and forward optic
+flow radiates from near the retina CENTER — the geometry the connectome
+has always seen (an earlier hemisphere-per-eye layout put the front at the
+retina edge, broke the brain's forward prior, and it preferred flying
+backward). Then the fly visual processing:
+
+1. **Spectral weighting** — R1-6 photoreceptor response, strongly
+   green-weighted (the fly's peak sensitivity), linearized, Naka-Rushton
+   soft-saturated with a photon-shot noise floor.
+2. **Ommatidial optics** — each eye's window is blurred by the facet
+   PSF (σ≈0.9 px @192×108): low acuity, wide acceptance angles.
+3. **Phasic motion channel** — an LMC-style high-pass (τ≈55 ms) mixed over
+   the sustained response: the retina responds to *change*, the lobula's
+   input.
+
+Each eye's window is the exact 192×108 frame in the same wire format —
+the connectome genuinely sees through fly eyes. `--eyes stereo` restores
+the plain ±35° camera pair, `--eyes center` the single forward camera
+duplicated to both eyes.
+
+The drone's **own body is hidden from its eyes** (Unreal `ke <pawn> 0`
+console toggle): the rear fly facets stare straight back at the airframe.
+Pose sets (takeoff, stuck-recovery, respawns) re-show the pawn, so the
+bridge re-hides after every one of them AND re-asserts every 5 s; the
+other vehicle is parked 400 m away so it can't pose as a body either.
+Verified with a frozen-world toggle test (scene paused, so the body is
+the only variable). The vehicle stays fully RPC-controllable while
+hidden.
+
+**Supersampled captures** (`config/airsim.settings.json`): cameras render
+384×216 and the fly-optics stage area-downsamples once to the 192×108
+retina — sharper facet averaging without changing the brain's retina
+grid.
+
+**Low-graphics mode** (`--gfx`, default on): on connect the bridge floors
+the game's scalability settings (resolution 25%, shadows/effects/
+postprocess/textures/view-distance/AA at 0) so the sim renders faster.
+Re-applied on every sim (re)connect; `--no-gfx` keeps stock visuals.
+
+**`ViewMode`** (`$USERPROFILE/Documents/AirSim/settings.json`): the default
+`"FlyWithMe"` renders the third-person chase camera in the game window so
+you can watch the drone fly. Setting `"NoDisplay"` disables the main
+viewport entirely — it was eating nearly half the frame budget (the eyes
+are scene captures; you'd watch the viewer instead) — measured: capture
+batches 120–140 ms → **74–78 ms**. With the viewport ON, the bridge's
+parallel capture pool still delivers **24–28 captures/s serial-limited,
+~66–70 eye-frames/s end-to-end**.
+
+**Parallel eye capture** — the sim's RPC serializes requests per
+connection, but its render pipeline takes captures CONCURRENTLY, so the
+bridge opens **one connection + one thread per camera**: measured 10–15
+captures/s on one socket → **~58–66/s across four**.
+
+**Net eye rate: ~2.6 → 66–70 eye-frames/s** with the third-person view
+rendering (up to ~80+ with `NoDisplay`; the remainder of the budget is the
+fly optics + viewer JPEG + brain-tick cost). `--vision-hz` remains a cap
+(default uncapped = sim-paced).
+
+**Fly-vision viewer:** while flying, the bridge serves what the brain
+literally receives at `http://localhost:8795` — both retinas on top (after
+the full optics), the raw wrap-around panorama below (`--viewer-port 0`
+disables). The brain's throttle fully owns altitude; a safety
+band only pushes back within ~1 m of `--min-alt` (0 m = ground; a climb-out
+guard keeps it from burrowing below 0.8 m) / `--max-alt` (60 m).
 A takeoff/recovery routine lifts the drone if it gets knocked to the ground.
 
 **Fixed-wing aircraft:** stock AirSim has no fixed-wing physics, so the bridge
@@ -184,7 +309,9 @@ bash scripts/start_airsim_stack.sh --cars     # brain + AirSimNH + car curriculu
 `--cars` is the training curriculum: every respawn teleports the drone to a
 fresh 14–22 m start next to the current target car, facing it, and near the
 target the shaping switches to pure progress — each 0.5 s tick that *closes*
-distance pulses a small reward (`--closing-gain` 0.1/m, capped 0.5), while
+distance pulses a small reward (`--closing-gain` 0.1/m, capped 0.5, gated
+by `--closing-min` 0.10 m/tick and measured in **horizontal** distance only
+— 3D distance let altitude bobbing register as false progress), while
 hovering or retreating sends nothing. Without it, episodes start from one
 fixed spawn and the approach gradient alone never bridged the last meters
 to the jackpot (359 episodes, 0 touches).
@@ -232,12 +359,17 @@ python scripts/reset_brain_memory.py           # wipe the live brain (hash-verif
 python scripts/reset_brain_memory.py --full    # wipe + set aside the disk memory file
 ```
 
-Useful flags: `--vision-hz 120` (web client's retina rate), `--min-alt 1.0`
-/ `--max-alt 30` (safety band), `--control lane|rate` (altitude scheme),
-`--stick-gain 2.0` / `--stick-tau 0.15` (FPV stick feel),
+Useful flags: `--vision-hz 0` (default: stream eyes as fast as the sim
+renders — the capture latency IS the pacing on slow machines; the value is
+only ever a cap), `--min-alt 0.0`
+/ `--max-alt 60` (safety band), `--control lane|rate` (altitude scheme),
+`--stick-gain 3.0` / `--stick-tau 0.15` (FPV stick feel),
+`--deadband 0.05` / `--no-trim` (auto-trim around the brain's resting
+channel values), `--yaw-tau 2.0` (heading-still smoothing),
 `--ceil-ride 2` / `--border-radius 450` (bounds policy),
 `--prox-max 0.5` / `--near-max 1.0` / `--near-radius 8` (shaping scales),
-`--no-assist`, `--eyes stereo|center`, `--reward alt`.
+`--no-assist`, `--eyes fly|stereo|center`, `--no-gfx`, `--viewer-port 0`,
+`--reward alt`.
 
 ## Talking to the brain
 
@@ -395,13 +527,16 @@ JSON file:
 
 - name your actuator `channels` (ranges, slew, defaults),
 - declare the `readout.map`: which signal (a population readout like
-  `dnSteer`, `flowRoll`, or a motor pool `pool0` / differential `pool1-pool2`)
+  `dnSteer`, or a motor pool `pool0` / differential `pool1-pool2`)
   drives which channel, with what gain,
 - set `sensors.eyes.count` (2 = stereo pair, 1 = forward camera) and which
   scalar state the body can sense.
 
 The readout maps *neural state → named channels* generically — no scripted
-behavior, no reflex ladders. Steering away from looming obstacles is a
+behavior, no reflex ladders. Retinal optic-flow signals (`flowPitch`,
+`flowRoll`, `flowYaw`) are **inputs to the connectome only**; they are never
+wired into the readout map, so no sensory→motor reflex bypasses learning.
+Steering away from looming obstacles is a
 property of the connectome's own T4/T5 → DN wiring, and it can be retrained
 via R-STDP. Channels the map does not drive stay at their configured default.
 

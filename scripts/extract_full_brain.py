@@ -12,6 +12,8 @@ keeps EVERY traced neuron and every traced->traced synapse (weight >= 1):
   - hex retinotopy + T4/T5 a/b/c/d directional subtypes where annotated
   - a plastic sub-circuit for reward learning: strongest 128 synapses per
     descending neuron (R-STDP memory attaches there)
+  - mushroom-body associative plasticity: ALL KC->MBON synapses are plastic
+    (the fly's canonical DAN-gated learning site; ~61k extra edges)
 
 Output (data/fly-brain-full.bin + .meta.json), little-endian:
   header   "FLYBRAIN1" (9 bytes)
@@ -46,6 +48,9 @@ OUT_META = Path(__file__).parent.parent / "data" / "fly-brain-full.meta.json"
 
 MIN_EDGE_W = 1  # keep every traced synapse
 PLASTIC_K = 128  # strongest inputs per DN kept plastic (R-STDP)
+MB_PLASTIC = True  # the mushroom body: ALL KC->MBON synapses plastic
+                   # (the fly's canonical associative-learning synapse;
+                   # DAN-gated, sparse code -> only ~61k edges, cheap)
 TOP_INPUTS_CAP = 4096  # safety cap on one neuron's inputs (guards dense hubs)
 
 
@@ -276,6 +281,13 @@ def main():
                 plastic_mask[idxs[top]] = True
             else:
                 plastic_mask[idxs] = True
+    # mushroom-body associative plasticity: every KC->MBON synapse. This is
+    # the fly's canonical three-factor learning site (sparse KC codings,
+    # DAN-gated depression/potentiation, MBON valence readout); downstream
+    # MBON->head wiring stays FIXED anatomy — only the associations store.
+    if MB_PLASTIC:
+        kc_g, mbon_g = gidx["KC"], gidx["MBON"]
+        plastic_mask |= (grp_arr[pre_s] == kc_g) & (grp_arr[post_s] == mbon_g)
     # build CSR-order masks
     r_order_kept = r_order[kept_mask[r_order]]
     kept_sorted = np.sort(r_order_kept)
@@ -322,6 +334,7 @@ def main():
         "groupOf": {g: int(sum(1 for x in groups if x == g)) for g in group_names},
         "minSynapseWeight": MIN_EDGE_W,
         "plasticK": PLASTIC_K,
+        "plasticMB": MB_PLASTIC,
         "dataset": "MaleCNS v1.0 - HHMI Janelia / Google Research, Cell 2026",
         "license": "CC-BY 4.0",
     }

@@ -26,6 +26,15 @@ eye RGB + body state ──WS :8787/stream──▶  C engine
 actuator channels ◀────60 Hz────────────  165,122-neuron LIF connectome
 ```
 
+**Where the learning lives (226,293 plastic synapses):** the strongest 128
+inputs per descending neuron (165,083 — what visual features drive
+steering) **plus every KC→MBON synapse in the mushroom body (61,210)** —
+the fly's canonical DAN-gated associative site. Sparse Kenyon codes mean
+the memory center costs almost nothing to train; MBON→head wiring stays
+fixed anatomy. Rebuild via `scripts/extract_full_brain.py` (the
+`MB_PLASTIC` flag), or flip it off to return to the DN-only brain
+(pre-MB connectome backed up as `data/fly-brain-full.preMB.bin`).
+
 The brain has no idea what body it is flying. It sees eyes and proprioception,
 spikes 165k neurons through the real connectome, and answers with actuator
 channels. What the body *is* — channels, ranges, sensor layout — is a JSON
@@ -303,18 +312,30 @@ cached once at startup.
 
 ```bash
 python scripts/reset_brain_memory.py --full   # fresh start
-bash scripts/start_airsim_stack.sh --cars     # brain + AirSimNH + car curriculum
+bash scripts/start_airsim_stack.sh            # brain + AirSimNH + car curriculum
 ```
 
-`--cars` is the training curriculum: every respawn teleports the drone to a
+`--cars` (default **on** since the reward-geometry fix; `--no-cars`
+disables) is the training curriculum: every respawn teleports the drone to a
 fresh 14–22 m start next to the current target car, facing it, and near the
 target the shaping switches to pure progress — each 0.5 s tick that *closes*
 distance pulses a small reward (`--closing-gain` 0.1/m, capped 0.5, gated
 by `--closing-min` 0.10 m/tick and measured in **horizontal** distance only
 — 3D distance let altitude bobbing register as false progress), while
-hovering or retreating sends nothing. Without it, episodes start from one
+hovering or retreating sends nothing. This is also what teaches *forward*
+flight: closing pulses are the only signal that aligns the pitch pool's
+arbitrary sign with actual approach. Without it, episodes start from one
 fixed spawn and the approach gradient alone never bridged the last meters
 to the jackpot (359 episodes, 0 touches).
+
+**Altitude shaping is a signed hill** (`--alt-gain` 0.2): +gain at 8 m,
+grading to 0 at ground level and at 16 m, then a growing **penalty** above
+(−gain by 24 m). An earlier neutral band let a throttle-pool ratchet park
+the drone at 22 m+ ("only goes up"); now altitude above the band costs
+reward every tick, so descending — shrinking an active penalty — is itself
+rewarded. The hill applies everywhere, including inside the approach zone.
+Negative shaping values flow through the brain's reward line as dopamine
+drops (punish-lite), which the engine handles natively.
 
 Watch the `[episode]` lines the bridge prints on every respawn (duration,
 hits, car touches, closest approach, closing pulses, mean dopamine) —

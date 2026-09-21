@@ -44,7 +44,9 @@ AirSim side:
   - the connectome decode cannot hover by construction (no altitude
     feedback in the motor pools), so the bridge keeps the drone inside a
     ground/ceiling safety band: the brain's throttle FULLY owns climb and
-    descent; the assist only pushes back within 1 m of the band edges.
+    descent; the assist only pushes back within ~1 m of the ceiling and
+    0.8 m of the ground (it used to reach 3 m up and swallow every
+    low-altitude descent command — the "never comes down" bug).
     --no-assist removes even that.
   - collisions punish (default -2.5) and respawn; parked-car touches reward
     (default +2.5) and respawn. --punish-mag / --reward-mag tune magnitudes.
@@ -839,6 +841,22 @@ class Bridge:
         d2 = min((p.x_val - x) ** 2 + (p.y_val - y) ** 2 + (p.z_val - z) ** 2
                  for x, y, z in self.car_poses)
         self._near_car = math.sqrt(d2)
+        # altitude-band shaping (SIGNED hill, peak +alt_gain at 8 m): below
+        # 16 m it grades to zero toward both ground and 16 m; ABOVE 16 m it
+        # turns into a growing penalty (−alt_gain by 24 m). A neutral
+        # ceiling taught nothing — the ratchet era ("only goes up") thrived
+        # on rewards that stayed positive at altitude. Descent now shrinks
+        # an active penalty, which the brain's relative shaping reads as a
+        # positive rate-of-change: coming down is itself rewarded.
+        alt_v = 0.0
+        if self._last_alt is not None:
+            alt = self._last_alt
+            if alt <= 16.0:
+                alt_v = self.args.alt_gain * clamp(
+                    1.0 - abs(alt - 8.0) / 8.0, 0.0, 1.0)
+            else:
+                alt_v = -self.args.alt_gain * clamp(
+                    (alt - 16.0) / 8.0, 0.0, 1.0)
         if (self.args.cars and self.args.prox_gain > 0.0
                 and self._near_car <= self.args.prox_radius):
             # near the training target: pure PROGRESS signal, measured in
@@ -863,25 +881,20 @@ class Bridge:
                 await ws.send(json.dumps(
                     {"type": "reward", "value": round(v, 3)}))
             self._last_target_near = near_h
+            if alt_v != 0.0:            # the hill applies everywhere,
+                await ws.send(json.dumps(   # including the approach zone
+                    {"type": "reward", "value": round(alt_v, 3)}))
             return
         v = self.args.prox_gain * (
             self.args.prox_max
             * clamp(1.0 - self._near_car / self.args.prox_radius, 0.0, 1.0)
             + self.args.near_max
             * clamp(1.0 - self._near_car / self.args.near_radius, 0.0, 1.0))
-        # altitude-band shaping: a grounded drone is outside the task (the
-        # targets are street-level cars), and with absolute throttle the
-        # untrained pool starts LOW — without this signal, punishment for
-        # terrain hits would only depress the throttle pool further (a
-        # punishment spiral). Sustained flight in the band earns a small
-        # continuous reward: a training signal for the throttle pool, NOT
-        # a controller — the brain still owns throttle entirely.
-        if self._last_alt is not None:
-            band = clamp(1.0 - abs(self._last_alt - 8.0) / 8.0, 0.0, 1.0)
-            v += self.args.alt_gain * band
+        v += alt_v
         self._prox_val = v
-        if v > 0.0:
-            await ws.send(json.dumps({"type": "reward", "value": round(v, 3)}))
+        if v != 0.0:                    # negative values are punish-lite:
+            await ws.send(json.dumps(   # legitimate training signal
+                {"type": "reward", "value": round(v, 3)}))
 
     async def handshake(self, ws) -> None:
         await ws.send(json.dumps({"type": "hello", "profile": "drone"}))
@@ -1415,11 +1428,16 @@ class Bridge:
         else:
             climb = s["climb"]
             if not self.args.no_assist:
-                # brain owns altitude; the band blends demand toward a safe
-                # rate within 1 m of an edge and FULLY overrides past it
+                # brain owns altitude; the band is a tiny anti-smash guard
+                # near the ground ONLY (0.8 m blend, full override at
+                # min_alt). It used to reach 3 m — which swallowed every
+                # descent command below 3 m, bounced the drone off an
+                # invisible floor in a climb-sawtooth, and made voluntary
+                # low-altitude descent unlearnable (no consequence, no
+                # gradient). Now the brain owns everything above ~1 m.
                 kin = client.simGetGroundTruthKinematics(self.args.vehicle)
                 alt = -kin.position.z_val
-                over = (self.args.min_alt + 3.0) - alt
+                over = (self.args.min_alt + 0.8) - alt
                 if over > 0.0:                  # floor: blend to +2 m/s climb
                     f = clamp(over, 0.0, 1.0)
                     climb = climb * (1.0 - f) + 2.0 * f
@@ -1564,10 +1582,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="world-frame z of the ground plane at the spawn area")
     ap.add_argument("--prox-gain", type=float, default=1.0,
                     help="proximity-reward gain (0 disables the shaping)")
-    ap.add_argument("--alt-gain", type=float, default=0.15,
-                    help="continuous reward for airborne flight in the "
-                         "0-16 m band (peak at 8 m; trains the throttle "
-                         "pool that staying aloft pays; 0 disables)")
+    ap.add_argument("--alt-gain", type=float, default=0.2,
+                    help="signed altitude-hill reward: +gain at 8 m "
+                         "grading to 0 at 0 m and 16 m, then a growing "
+                         "penalty above (−gain by 24 m) — makes coming "
+                         "down itself rewarding; 0 disables")
     ap.add_argument("--prox-radius", type=float, default=40.0,
                     help="nearest-car distance beyond which prox reward is 0 (m)")
     ap.add_argument("--prox-max", type=float, default=0.5,
@@ -1577,9 +1596,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--near-max", type=float, default=1.0,
                     help="near-field reward at 0 m (must stay below reward-mag "
                          "so touching a car still pays more than hovering over it)")
-    ap.add_argument("--cars", action="store_true",
+    ap.add_argument("--cars", action=argparse.BooleanOptionalAction,
+                    default=True,
                     help="car-crash curriculum: every respawn starts a fresh "
-                         "14-22 m approach to the current target car")
+                         "14-22 m approach to the current target car "
+                         "(default on; --no-cars disables)")
     ap.add_argument("--closing-gain", type=float, default=0.1,
                     help="cars mode: reward per meter closed toward the "
                          "target car (capped at 0.5 per pulse)")

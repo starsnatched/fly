@@ -50,12 +50,11 @@ AirSim side:
     --no-assist removes even that.
   - collisions punish (default -2.5) and respawn; parked-car touches reward
     (default +2.5) and respawn. --punish-mag / --reward-mag tune magnitudes.
-  - proximity shaping: every 0.5 s a small reward pulse proportional to
-    closeness to the nearest parked car (3D distance), on two scales — a
-    far gradient (40 m, small) to guide the brain toward a street with
-    cars, and a steeper near gradient (8 m, stronger) for the final
-    approach. The brain's relative reward shaping turns this into
-    "closing in on cars is good, retreating is bad". --prox-gain 0 off.
+  - approach shaping is PROGRESS-ONLY: each 0.5 s tick that closes
+    horizontal distance to the target car pulses a small reward
+    (--closing-gain/m, capped). Hovering/retreating sends nothing. The
+    old continuous closeness gradient (paid for being near) is removed —
+    it rewarded hovering and let altitude bobbing count as value.
   - --cars turns this into a full car-crash curriculum: the respawn point
     becomes a fresh 14-22 m start next to the target car facing it, and
     near the target the shaping switches to pure progress — every tick
@@ -92,8 +91,8 @@ import websockets
 # ---- the training objective (car-crash curriculum) -------------------------
 # Everything below turns "crash into cars" into a shaped learning problem:
 #   touch car  -> +2.5 (reward-mag) jackpot + respawn
-#   near field -> approach gradient up to +1.0 (near-max) within 8 m
-#   far field  -> approach gradient up to +0.5 (prox-max) within 40 m
+#   progress   -> closing pulses (proximity_reward): paid for approach,
+#                 never for position
 #   anything else -> -2.5 (punish-mag) and respawn
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -205,6 +204,9 @@ CAR_SPAWN_ALT = 6.0    # respawn height in cars mode (m) — cars visible early
 CAR_SPAWN_DIST = (14.0, 22.0)  # spawn-distance range from the target car (m)
 GROUND_Z = 0.0         # world-frame z of the ground plane (--ground-z)
 RESPAWN_COOLDOWN_S = 2.5   # ignore collisions this long after a respawn
+SPAWN_HOLD_S = 3.0   # hold-level at episode start until the brain commands
+                     # up (anti-cold-start; the brain owns the aircraft the
+                     # moment it wants to climb or the timer ends)
 
 # ---- punishment protocol (dopa-tail-aware) ----------------------------------
 # Measured live on the wing brain (cengine source + dopamine probes):
@@ -218,8 +220,13 @@ RESPAWN_COOLDOWN_S = 2.5   # ignore collisions this long after a respawn
 # New protocol: one deep pulse, then HOLD the crash scene (retina keeps the
 # context, motors frozen so recovery isn't accidentally punished) until the
 # dopamine error recovers — only then respawn onto a clean slate.
-PUNISH_MAG_DEFAULT = -5.0   # lands as dan_drive -1.5 (the clamp) = deepest window
+PUNISH_MAG_DEFAULT = -2.5   # was -5: crash streams outgunned every reward
+                            # (net-negative dopamine => pool treadmill). -2.5
+                            # still dwarfs the +0.2 altitude hill but lets
+                            # minutes of good flight outweigh one mistake
 REWARD_MAG_DEFAULT = 2.5
+ALT_GAIN_DEFAULT = 0.35     # was 0.2: the altitude hill is the throttle
+                            # pool's main positive teacher
 STUN_HOLD_S = 4.5           # minimum scene-hold after a punish (dopa tail 4.5-6 s)
 STUN_MAX_S = 6.5            # hard cap; dopa recovery usually releases earlier
 DOPA_RECOVER = -0.03        # respawn gate: dopa error above this = tail drained
@@ -359,6 +366,10 @@ class _FlyViewerHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass   # viewer tab polling faster than we produce frames
 
+    def do_POST(self):  # noqa: N802 (http.server API)
+        # /cmd lands here (do_GET's router checks self.command)
+        self.do_GET()
+
     def _do_get(self):
         if self.path.startswith("/frame"):
             with self.bridge._fly_state_lock:
@@ -376,6 +387,40 @@ class _FlyViewerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(_FLY_VIEWER_HTML)))
             self.end_headers()
             self.wfile.write(_FLY_VIEWER_HTML)
+        elif self.path == "/cmd" and self.command == "POST":
+            # simple human commands: {"cmd": "..."} or {"cmd": "car N"} /
+            # {"cmd": "hover"}. Curriculum + training signals only.
+            try:
+                n = int(self.headers.get("Content-Length", 0) or 0)
+                obj = json.loads(self.rfile.read(n) or b"{}")
+                text = str(obj.get("cmd", "")).strip()
+                reply = self.bridge._handle_command(text)
+            except Exception as exc:                      # noqa: BLE001
+                reply = f"error: {exc!r}"
+            body = json.dumps({"ok": not reply.startswith("error"),
+                               "reply": reply}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/status":
+            b = self.bridge
+            body = json.dumps({
+                "alt": round(b._last_alt or 0.0, 1),
+                "near": (round(b._near_car, 1)
+                         if b._near_car != float("inf") else None),
+                "target": b._target_idx,
+                "cars": b.car_bumps,
+                "hits": b.collision_count,
+                "dopa": round(b.dopa, 3),
+                "commands": b._cmd_q,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_error(404)
 
@@ -462,6 +507,7 @@ class Bridge:
         # auto-trim: each attitude channel's resting value (None = pending
         # first brain action); centered sticks are deflections FROM this
         self.trim = {"pitch": None, "roll": None, "yaw": None}
+        self._trim_frozen = False
         self._trim_at = 0.0
         self._trim_samples: list[tuple[float, dict[str, float]]] = []
         self._trim_windows = 0
@@ -483,6 +529,22 @@ class Bridge:
         self._target_idx = 0        # which parked car is the current target
         self._car_pulses = 0        # approach pulses on the current target
         self._last_target_near = float("inf")
+        # simple human command interface: viewer HTTP POSTs land on this
+        # queue and are consumed between control ticks. Commands set the
+        # CURRICULUM and TRAINING SIGNALS (which car is the goal, spawn
+        # where, jackpot on/off); they never write actuator values — the
+        # connectome keeps 100% of the flying.
+        self._cmd_q: list[dict] = []
+        self._jackpot_enabled = True
+        self._car_paid: set[int] = set()   # targets already paid this run
+        # spawn hold: for the first moments of an episode the aircraft is
+        # HELD LEVEL (never sinks) unless the brain commands climb. This is
+        # spawn initialization (like the face-car heading), not behavior:
+        # the instant the brain commands up — or the timer ends — it owns
+        # the aircraft completely, and NO shaping is paid during the hold,
+        # so the circuit isn't rewarded for the bridge's help either.
+        self._spawn_hold_until = 0.0
+        self._cmd_client = None            # sim client for manual reset
         self._near_car = float("inf")
         self._prox_val = 0.0
         self._last_alt: float | None = None
@@ -537,6 +599,7 @@ class Bridge:
                               f"(of {len(self.car_poses)}); each respawn starts "
                               f"a fresh 14-22 m approach", flush=True)
                     self._ep_origin = (self.spawn.x_val, self.spawn.y_val)
+                    self._cmd_client = client   # for manual reset commands
                     self._sim_ready = True
                 else:
                     # Sim may have restarted while the bridge lived on: a
@@ -815,21 +878,25 @@ class Bridge:
         self._ep_dopa_n = 0
 
     async def proximity_reward(self, ws, kin, now: float) -> None:
-        """Continuous shaping stream: a small reward pulse every 0.5 s,
-        proportional to closeness of the nearest parked car (3D distance).
-        The brain's relative shaping (tau 12 s) adapts to any steady value,
-        so what actually gets reinforced is the GRADIENT: closing in on a
-        car drives dopamine up, drifting away drives it down — a guidance
-        signal toward the +2.5 car-touch event, without drowning it.
+        """Event-and-progress shaping only. The continuous Closeness
+        gradient (a reward for merely BEING near a car, on far/near
+        scales) was removed: it paid for hovering over the target, made
+        altitude bobbing register as value, and taught "cars make dopamine
+        happen" instead of "approaching cars is my doing". What remains:
 
-        Two scales (car-crash training):
-          far  — linear over --prox-radius (40 m), small (--prox-max 0.5):
-                 gets the brain into the right street from cruise distance;
-          near — steeper over --near-radius (8 m), stronger (--near-max 1.0):
-                 a clear approach gradient once a car is actually in sight.
-        The near max stays below the car-touch reward, so touching a car
-        always pays more than hovering over it."""
-        if self.args.prox_gain <= 0.0 or not self.car_poses:
+          closing pulses — each 0.5 s tick that CLOSES horizontal distance
+                to the current target car (by --closing-min) pulses a
+                small reward proportional to meters gained. Progress, not
+                position: hovering and retreating send nothing.
+          altitude hill — the SIGNED band (peak +alt_gain at 8 m, penalty
+                above 16 m), applied everywhere including the approach
+                zone. Staying airborne is the prerequisite skill.
+          car-touch jackpot — the +2.5 event (+2.5 one-time per target).
+
+        The brain's relative shaping (tau 12 s) turns the closing pulses
+        into "my approach produced this" credit; the HUD's `near` readout
+        stays as pure telemetry (no reward attached)."""
+        if not self.car_poses:
             self._prox_val = 0.0
             return
         if self.in_stun():
@@ -837,6 +904,9 @@ class Bridge:
         if now - self._last_prox_t < 0.5:
             return
         self._last_prox_t = now
+        if now < self._spawn_hold_until:
+            return    # bridge is holding the aircraft: pay no shaping, so
+                      # the circuit isn't rewarded for the bridge's help
         p = kin.position
         d2 = min((p.x_val - x) ** 2 + (p.y_val - y) ** 2 + (p.z_val - z) ** 2
                  for x, y, z in self.car_poses)
@@ -857,44 +927,28 @@ class Bridge:
             else:
                 alt_v = -self.args.alt_gain * clamp(
                     (alt - 16.0) / 8.0, 0.0, 1.0)
-        if (self.args.cars and self.args.prox_gain > 0.0
-                and self._near_car <= self.args.prox_radius):
-            # near the training target: pure PROGRESS signal, measured in
-            # HORIZONTAL distance only — the approach task is XY, and using
-            # 3D distance let altitude bobbing (lane-tracking oscillation)
-            # register as closing/retreating every tick even at a dead
-            # hover. Hovering and retreating send nothing (the brain's
-            # relative shaping treats silence as neutral); each 0.5 s tick
-            # that closes at least --closing-min meters pulses a small
-            # reward proportional to meters gained. The minimum gate kills
-            # residual horizontal jitter drips.
-            d2h = min((p.x_val - x) ** 2 + (p.y_val - y) ** 2
-                      for x, y, _z in self.car_poses)
-            near_h = math.sqrt(d2h)
-            if self._last_target_near == float("inf"):
-                pass                        # first reading: baseline only
-            elif self._last_target_near - near_h >= self.args.closing_min:
-                gained = self._last_target_near - near_h
-                v = min(self.args.closing_gain * gained, 0.5)
-                self._car_pulses += 1
-                self._prox_val = v
-                await ws.send(json.dumps(
-                    {"type": "reward", "value": round(v, 3)}))
-            self._last_target_near = near_h
-            if alt_v != 0.0:            # the hill applies everywhere,
-                await ws.send(json.dumps(   # including the approach zone
-                    {"type": "reward", "value": round(alt_v, 3)}))
+        if alt_v != 0.0:
+            await ws.send(json.dumps(
+                {"type": "reward", "value": round(alt_v, 3)}))
+        if not self.args.cars:
             return
-        v = self.args.prox_gain * (
-            self.args.prox_max
-            * clamp(1.0 - self._near_car / self.args.prox_radius, 0.0, 1.0)
-            + self.args.near_max
-            * clamp(1.0 - self._near_car / self.args.near_radius, 0.0, 1.0))
-        v += alt_v
-        self._prox_val = v
-        if v != 0.0:                    # negative values are punish-lite:
-            await ws.send(json.dumps(   # legitimate training signal
+        # closing-progress pulses on the CURRENT TARGET, horizontal only —
+        # the approach task is XY, and using 3D distance let altitude
+        # bobbing register as false progress. Each tick that closes at
+        # least --closing-min meters pulses reward proportional to meters
+        # gained; hovering and retreating send nothing.
+        tx, ty, _tz = self.car_poses[self._target_idx]
+        near_h = math.sqrt((p.x_val - tx) ** 2 + (p.y_val - ty) ** 2)
+        if self._last_target_near == float("inf"):
+            pass                        # first reading: baseline only
+        elif self._last_target_near - near_h >= self.args.closing_min:
+            gained = self._last_target_near - near_h
+            v = min(self.args.closing_gain * gained, 0.5)
+            self._car_pulses += 1
+            self._prox_val = v
+            await ws.send(json.dumps(
                 {"type": "reward", "value": round(v, 3)}))
+        self._last_target_near = near_h
 
     async def handshake(self, ws) -> None:
         await ws.send(json.dumps({"type": "hello", "profile": "drone"}))
@@ -917,6 +971,9 @@ class Bridge:
         try:
             while True:
                 now = time.perf_counter()
+
+                # human commands (viewer /cmd) set curriculum + signals
+                self._drain_commands()
 
                 # stream the eye pair + body state
                 if now >= next_send:
@@ -1154,7 +1211,15 @@ class Bridge:
         if is_car:
             self.car_bumps += 1
             mag = self.args.reward_mag
-            sign = "car reward"
+            if self._target_idx not in self._car_paid:
+                self._car_paid.add(self._target_idx)
+                if self._jackpot_enabled:
+                    mag += 2.5    # first touch of THIS target: one-time bonus
+                    sign = "car reward + jackpot"
+                else:
+                    sign = "car reward (jackpot off)"
+            else:
+                sign = "car reward (repeat)"
         else:
             self.collision_count += 1
             mag = self.args.punish_mag
@@ -1162,7 +1227,7 @@ class Bridge:
         asyncio.get_running_loop().create_task(
             self.send_reward_now(mag))
         self.begin_event_stun(mag, "car touch" if is_car else "collision")
-        print(f"[sim] collision [{obj or 'unknown'}] -> {sign} {mag:+.1f}; "
+        print(f"[sim] {sign} [{obj or 'unknown'}] {mag:+.1f}; "
               f"holding scene until dopa recovers "
               f"(hits {self.collision_count}, cars {self.car_bumps})", flush=True)
         self.end_episode("collision" if not is_car else "car touch")
@@ -1193,11 +1258,12 @@ class Bridge:
         return time.perf_counter() < self._stun_until
 
     def respawn(self, client) -> None:
-        """Cars mode: teleport next to a random parked car (the target is
-        picked at startup), facing it, close enough that the car is inside
-        the retina and the near-field gradient. Street mode: back to the
-        spawn XY at the ABSOLUTE respawn altitude (never relative to
-        wherever the drone was when the bridge started)."""
+        """Cars mode: teleport next to the current target car, facing it
+        (atan2 bearing -> Z-rotation quaternion; body +x lands on the
+        car), close enough that the car is inside the retina and the
+        closing-progress signal. Street mode: back to the spawn XY at the
+        ABSOLUTE respawn altitude (never relative to wherever the drone
+        was when the bridge started)."""
         pose = client.simGetVehiclePose(self.args.vehicle)
         wing = self.args.airframe == "wing"
         spawn_alt = (CAR_SPAWN_ALT if self.args.cars else RESPAWN_ALT) \
@@ -1234,7 +1300,17 @@ class Bridge:
             )
         # kill any stale brain stick bias so the fresh episode starts calm
         self.cmd = {"throttle": BRAIN_HOVER, "pitch": 0.0, "roll": 0.0, "yaw": 0.0}
-        self.trim = {"pitch": None, "roll": None, "yaw": None}
+        # CARRY the previous episode's trim across the respawn: the circuit's
+        # resting state doesn't change at an episode boundary, and starting
+        # with trim=None mutes pitch/roll/yaw (centered() refuses to act on
+        # raw bias) until a quiet calibration window lands — seconds of no
+        # steering while absolute sub-hover throttle dove the drone into the
+        # ground. With the carried trim the brain controls from frame 0; the
+        # quiet-window sampler below still refreshes the estimate for future
+        # episodes, so long-term drift stays tracked.
+        if not self._trim_frozen:
+            self.trim = {"pitch": None, "roll": None, "yaw": None}
+        self._trim_frozen = False
         self._trim_at = 0.0
         self._trim_samples: list[tuple[float, dict[str, float]]] = []
         self._trim_windows = 0
@@ -1242,6 +1318,7 @@ class Bridge:
         self._ceil_since = 0.0
         self._last_target_near = float("inf")   # fresh approach baseline
         self._car_pulses = 0
+        self._spawn_hold_until = time.perf_counter() + SPAWN_HOLD_S
         client.moveByVelocityBodyFrameAsync(
             0.0, 0.0, -1.5, 1.0,
             airsim.DrivetrainType.MaxDegreeOfFreedom,
@@ -1353,14 +1430,18 @@ class Bridge:
         This is the crucial property: a continuous adaptive trim absorbs
         sustained channel offsets, but flight COMMANDS *are* sustained
         offsets — an adaptive trim ate them (the drone could only spin and
-        change altitude). A frozen center makes deflections meaningful for
-        the whole episode and is re-derived fresh at every respawn, so it
-        always tracks the circuit's current resting state.
+        change altitude).
+
+        The frozen center is CARRIED across respawns: the previous episode's
+        trim governs from frame 0 (no mute gap — the sampler can't be trusted
+        to land a quiet window quickly, and it rejects windows whenever the
+        brain is active), while this sampler keeps re-deriving a fresh
+        estimate so it tracks the circuit's slowly drifting resting state.
         """
         now = time.perf_counter()
         if self.in_stun() or not self.got_actions:
             return
-        if self.trim["pitch"] is not None:
+        if self._trim_frozen:
             return                        # calibrated this episode: frozen
         self._trim_samples.append(
             (now, {k: clamp(self.cmd[k], -1.0, 1.0)
@@ -1383,6 +1464,7 @@ class Bridge:
         for name in ("pitch", "roll", "yaw"):
             vals = sorted(s[1][name] for s in self._trim_samples)
             self.trim[name] = vals[len(vals) // 2]
+        self._trim_frozen = True
         self._trim_samples = []
         print(f"[trim] calibrated (frozen for episode): "
               f"pitch {self.trim['pitch']:+.3f} "
@@ -1427,6 +1509,10 @@ class Bridge:
             climb = 0.0
         else:
             climb = s["climb"]
+            if now < self._spawn_hold_until and climb < 0.5:
+                # spawn hold: block descent demands only; the first climb
+                # command hands control straight back to the brain
+                climb = 0.3
             if not self.args.no_assist:
                 # brain owns altitude; the band is a tiny anti-smash guard
                 # near the ground ONLY (0.8 m blend, full override at
@@ -1486,6 +1572,84 @@ class Bridge:
             self.telemetry = obj
             self.dopa = float(obj.get("dopa", 0.0) or 0.0)
             self.learning = bool(obj.get("learning", False))
+
+    # ---- human command interface (curriculum only, never actuators) -------
+    def _handle_command(self, text: str) -> str:
+        """Map a typed command to queue actions. Everything here sets the
+        TASK (goal, spawn, signals) the same way flags do at startup; no
+        line decides a motor output, so the brain still earns the behavior
+        itself through R-STDP."""
+        t = text.strip().lower()
+        if not t:
+            return "error: empty command"
+        if t == "reset":
+            self._cmd_q.append({"t": "reset"})
+            return "respawning now"
+        if t in ("new car", "next car"):
+            self._cmd_q.append({"t": "newcar"})
+            return "picking a new target car at the next respawn"
+        m = re.fullmatch(r"car #?(\d+)", t)
+        if m:
+            idx = int(m.group(1))
+            if not self.car_poses or not (0 <= idx < len(self.car_poses)):
+                return (f"error: car index out of range "
+                        f"(0..{max(0, len(self.car_poses) - 1)})")
+            self._cmd_q.append({"t": "car", "idx": idx})
+            return f"target set to car #{idx}; takes effect at the next respawn"
+        if t == "hover":
+            self._cmd_q.append({"t": "hold"})
+            return "brain paused for 5 s (affects the next episode), then flying again"
+        if t == "go":
+            self._cmd_q.append({"t": "resume"})
+            return "training resumed (if it was held)"
+        if t == "training on":
+            self._cmd_q.append({"t": "resume"})
+            return "training resumed"
+        if t == "training off":
+            self._cmd_q.append({"t": "hold"})
+            return "brain paused for 5 s (affects the next episode)"
+        if t == "jackpot on":
+            self._jackpot_enabled = True
+            return "car-touch jackpot on"
+        if t == "jackpot off":
+            self._jackpot_enabled = False
+            return "car-touch jackpot off"
+        return ("error: unknown command (try: car N, new car, hover, go, "
+                "reset, jackpot on/off)")
+
+    def _drain_commands(self) -> None:
+        """Consume queued commands on the control thread."""
+        while self._cmd_q:
+            c = self._cmd_q.pop(0)
+            k = c["t"]
+            if k == "car":
+                self._target_idx = c["idx"]
+                self._car_paid.discard(c["idx"])   # fresh jackpot for it
+                print(f"[cmd] target car -> #{self._target_idx}", flush=True)
+            elif k == "newcar" and self.car_poses:
+                others = [i for i in range(len(self.car_poses))
+                          if i != self._target_idx]
+                self._target_idx = random.choice(others) if others else 0
+                self._car_paid.discard(self._target_idx)
+                print(f"[cmd] new target car -> #{self._target_idx}",
+                      flush=True)
+            elif k == "reset":
+                self._stun_until = 0.0
+                self._spawn_hold_until = 0.0
+                self.end_episode("command reset")
+                try:
+                    client = self._cmd_client
+                except AttributeError:
+                    client = None
+                if client is not None:
+                    self.respawn(client)
+                print("[cmd] manual reset", flush=True)
+            elif k == "hold":
+                self._spawn_hold_until = time.perf_counter() + 5.0
+                print("[cmd] holding (brain paused 5 s)", flush=True)
+            elif k == "resume":
+                self._spawn_hold_until = 0.0
+                print("[cmd] resumed", flush=True)
 
     # ---- reward shaping (optional) ----------------------------------------
     async def send_reward_now(self, value: float) -> None:
@@ -1582,7 +1746,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="world-frame z of the ground plane at the spawn area")
     ap.add_argument("--prox-gain", type=float, default=1.0,
                     help="proximity-reward gain (0 disables the shaping)")
-    ap.add_argument("--alt-gain", type=float, default=0.2,
+    ap.add_argument("--alt-gain", type=float, default=ALT_GAIN_DEFAULT,
                     help="signed altitude-hill reward: +gain at 8 m "
                          "grading to 0 at 0 m and 16 m, then a growing "
                          "penalty above (−gain by 24 m) — makes coming "

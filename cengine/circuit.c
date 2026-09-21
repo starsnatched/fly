@@ -93,6 +93,7 @@ void fb_params_default(FbParams *p) {
     p->a_ltd = 0.03f;
     p->w_min = 0.6f;
     p->w_max = 1.6f;
+    p->w_floor = 0.1f;
     p->k_scale = 0.001f;
     p->scale_every = 10;
     p->seed = 0x9E3779B9u;
@@ -144,13 +145,23 @@ typedef struct { int64_t tgt; int pos; } TgtPos;
  * dopa<0 depresses them. The (spike - tonic) term means a constant
  * situation teaches nothing — the same anti-wedging rule the synapses
  * follow. Weights persist in the memory file alongside the synapse
- * multipliers, keyed by neuron id + group name. */
+ * multipliers, keyed by neuron id + group name.
+ *
+ * Pools clamp to [w_floor, w_max], NOT to w_min: the pool integral IS the
+ * actuator signal, so weights stuck at w_min output a large constant
+ * offset that railed the client's channel clamp — the body could then
+ * never earn dopa>0 to re-potentiate (the "thrust is always 0" failure).
+ * w_floor sits where the pool output is ≈ its floor: fully-depressed =
+ * silent = neutral stick, with full headroom to recover. */
 struct FbPool {
     int64_t *ids;         /* member neuron ids (circuit indices) */
     int n;
     int64_t *widx;        /* parallel plastic weight idx (== ids when learn) */
     double *w;            /* plastic multipliers (only when learn) */
     int learn;
+    float lr_scale;       /* per-pool multiplier on circuit pool_lr (1.0)
+                          * — lets one actuator learn faster (e.g. throttle
+                          * 40x) without touching the others */
     float set_hz;         /* group tonic rate: (spike - tonic) learning ref */
     float acc;            /* leaky spike integral = raw actuator signal */
     float decay;          /* per-tick multiplier from integrate_ms */
@@ -1099,7 +1110,7 @@ int fb_load_memory(FbCircuit *n, const int *idx, const double *w, int count) {
 /* ------------------------------------------------- motor pools (see top) */
 
 int fb_pools_configure(FbCircuit *n, const FbPoolCfg *cfgs, int n_cfgs,
-                       int integrate_ms, int learn) {
+                       int integrate_ms, int learn, float pool_lr) {
     for (int i = 0; i < n->n_pools; i++) {
         free(n->pools[i].ids);
         free(n->pools[i].widx);
@@ -1109,6 +1120,7 @@ int fb_pools_configure(FbCircuit *n, const FbPoolCfg *cfgs, int n_cfgs,
     n->pools = NULL;
     n->n_pools = 0;
     if (!cfgs || n_cfgs <= 0) return 0;
+    n->pool_lr = pool_lr > 0.0f ? pool_lr : 0.08f;   /* a_ltp per second */
     int tau_ms = integrate_ms > 0 ? integrate_ms : 80;
     FbPool *p = (FbPool *)calloc((size_t)n_cfgs, sizeof(FbPool));
     if (!p) return 0;
@@ -1160,6 +1172,7 @@ int fb_pools_configure(FbCircuit *n, const FbPoolCfg *cfgs, int n_cfgs,
         p[built].ids = ids;
         p[built].n = m;
         p[built].learn = learn ? 1 : 0;
+        p[built].lr_scale = pc->lr_scale > 0.0f ? pc->lr_scale : 1.0f;
         p[built].set_hz = n->bio_set_hz[ids[0]] > 0.5f
             ? n->bio_set_hz[ids[0]] : 2.0f;
         if (learn) {
@@ -1193,9 +1206,10 @@ int fb_pools_count(const FbCircuit *n) { return n->n_pools; }
  * the pool. lr matches the synapse LTP rate per second. */
 static void fb_pools_tick(FbCircuit *n, float dopa) {
     const float dt = (float)FB_DT_MS;
-    const float lr = 0.08f / 1000.0f * dt;   /* a_ltp per tick */
+    const float lr = n->pool_lr / 1000.0f * dt;   /* a_ltp per tick (readout.poolLr, default 0.08) */
     for (int i = 0; i < n->n_pools; i++) {
         FbPool *pl = &n->pools[i];
+        const float plr = lr * pl->lr_scale;
         pl->acc *= pl->decay;
         if (pl->acc < 1e-5f) pl->acc = 0.0f;
         if (dopa != 0.0f && pl->learn) {
@@ -1205,12 +1219,13 @@ static void fb_pools_tick(FbCircuit *n, float dopa) {
                 const float act = (float)(n->spike_counts[j] > 0) - base;
                 if (act == 0.0f) continue;
                 double w = pl->w[k];
-                double room = (dopa > 0.0f) ? (n->p.w_max - w) : (w - n->p.w_min);
-                double full = (double)n->p.w_max - (double)n->p.w_min;
-                double move = (double)lr * (double)dopa * (double)act;
+                double room = (dopa > 0.0f) ? (n->p.w_max - w)
+                                            : (w - n->p.w_floor);
+                double full = (double)n->p.w_max - (double)n->p.w_floor;
+                double move = (double)plr * (double)dopa * (double)act;
                 if (move > 0) move *= room / full;
                 double wm = w + move;
-                if (wm < n->p.w_min) wm = n->p.w_min;
+                if (wm < n->p.w_floor) wm = n->p.w_floor;
                 if (wm > n->p.w_max) wm = n->p.w_max;
                 pl->w[k] = wm;
             }

@@ -6,7 +6,8 @@
     "pools": [
       {
         "group": "motor",
-        "every": 7
+        "every": 7,
+        "lrScale": 40
       },
       {
         "group": "motor",
@@ -39,8 +40,12 @@
       {
         "channel": "throttle",
         "signal": "pool0",
-        "gain": 1.0,
-        "offset": -0.13
+        "gain": 0.73,
+        "offset": 0.29,
+        "norm": {
+          "span": 0.45,
+          "center": 0.3
+        }
       },
       {
         "channel": "pitch",
@@ -60,7 +65,8 @@
         "gain": 3.0,
         "shape": "tanh"
       }
-    ]
+    ],
+    "poolLr": 0.8
   },
   "actuators": {
     "channels": [

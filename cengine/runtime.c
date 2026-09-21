@@ -225,6 +225,21 @@ static void readout_compute(FbRuntime *rt, float *out /* n_channels */) {
             if (strcmp(rt->ch[i].name, e->channel) == 0) { ch = i; break; }
         if (ch < 0) continue;
         float v = e->shape ? tanhf(sv) : sv;
+        /* per-entry "norm": rescale a signal's working range to the
+         * full [-1,1] stick (readout normalization). This is range
+         * calibration, NOT policy: the timing and sign of every deflection
+         * stay owned by the circuit, and the connectome's pool learning
+         * naturally re-centers around the new operating point — the same
+         * reason the per-episode trim is legitimate. `center` is the
+         * signal's measured resting value (differentials like "pool3-pool4"
+         * rest at 0; rectified pools like "pool0" rest near 0.3-0.5
+         * depending on their learned weights — measure it live via
+         * /telemetry poolsRaw and set it; a wrong center rails the
+         * channel at one end and starves the reward loop). */
+        if (e->has_norm) {
+            sv = (sv - e->norm_center) * 2.0f / e->norm_span;
+            v = e->shape ? tanhf(sv) : sv;
+        }
         out[ch] += e->offset + e->gain * v;
     }
     /* clamp here too; actuators_apply applies the channel slew after */
@@ -233,9 +248,7 @@ static void readout_compute(FbRuntime *rt, float *out /* n_channels */) {
         if (out[i] > rt->cfg.ch_hi[i]) out[i] = rt->cfg.ch_hi[i];
         if (strcmp(rt->ch[i].name, "yaw") == 0) yaw_cmd = out[i];
     }
-    rt->last_turn_cmd = yaw_cmd;
-
-    /* tau (time-to-contact) percept for telemetry — an internal estimate
+    rt->last_turn_cmd = yaw_cmd;        /* tau (time-to-contact) percept for telemetry — an internal estimate
      * from the EMD flow (looming = close); drives NO behavior directly */
     if (rt->sens.coll_hold_s > 0.0) {
         rt->sens.coll_hold_s -= 1.0 / 60.0;
@@ -485,9 +498,10 @@ FbRuntime *fb_runtime_new(const FbConfig *cfg) {
             pcfg[npcfg].every = cfg->pools[i].every;
             pcfg[npcfg].split_lr = cfg->pools[i].split_lr;
             pcfg[npcfg].which = cfg->pools[i].which;
+            pcfg[npcfg].lr_scale = cfg->pools[i].lr_scale;
             npcfg++;
         }
-        int built = fb_pools_configure(rt->net, pcfg, npcfg,
+        int built = fb_pools_configure(rt->net, pcfg, npcfg, cfg->pool_lr,
                                        cfg->pool_integrate_ms, cfg->pool_learn);
         if (built != cfg->n_pools)
             fprintf(stderr, "config: pools built %d of %d declared\n",

@@ -284,29 +284,32 @@ lasts **4.5–6 s**: respawning immediately dumps the tail onto the *next*
 episode's good flying while the crash-context synapses get less LTD than
 they should. Holding the scene keeps the negative window overlapped with
 the synapses that caused the crash — clean credit assignment. Car touches
-(`Car_*` in AirSimNH) send **+2.5** with a short 1.5 s hold so the positive
-tail doesn't spuriously reinforce the next episode's opening moves. Riding
-the ceiling (`--max-alt`) for more than `--ceil-ride` seconds (2 s) or
-leaving the per-episode spawn leash (`--border-radius`, 450 m) punishes the
-same way. `--punish-mag` / `--reward-mag` tune the magnitudes. Each event
-names the object hit (or `ceiling` / `map border`) in the bridge log, and
-the HUD shows `STUN[...]` with remaining hold time and live dopa during the
-hold. `--reward alt` additionally enables classic reward shaping (altitude
-+ forward progress) on top of the event pulses.
+(`Car_*` in AirSimNH) send **+2.5** — plus a one-time **+2.5 jackpot** for
+the first touch of each distinct target car (per-target, once per run;
+`jackpot on/off` via the command interface) — with a short 1.5 s hold so
+the positive tail doesn't spuriously reinforce the next episode's opening
+moves. Riding the ceiling (`--max-alt`) for more than `--ceil-ride`
+seconds (2 s) or leaving the per-episode spawn leash (`--border-radius`,
+450 m) punishes the same way. Collision punish defaults to **−2.5** (was
+−5: a crash stream that outgunned every reward made the dopamine
+environment net-negative and put the throttle pool on a depression
+treadmill — the "keeps falling" era). `--punish-mag` / `--reward-mag`
+tune the magnitudes; the altitude hill (`--alt-gain`, default 0.35) is
+the throttle pool's main positive teacher. Each event names the object
+hit (or `ceiling` / `map border`) in the bridge log, and the HUD shows
+`STUN[...]` with remaining hold time and live dopa during the hold.
 
-**Proximity reward:** every 0.5 s the bridge also streams a small shaping
-pulse proportional to closeness of the nearest parked car (3D distance), on
-two scales — a **far gradient** (linear to 0 beyond `--prox-radius` 40 m,
-`--prox-max` 0.5 at contact) that guides the brain toward a street with cars
-from cruise distance, and a **near gradient** (steeper, within
-`--near-radius` 8 m, up to `--near-max` 1.0 at contact) for the final
-approach. The near max stays below the +2.5 car touch, so touching a car
-always pays more than hovering over one.
-The brain's relative reward shaping (τ = 12 s) adapts to any steady value, so
-this reinforces the *gradient*: closing in on a car is good, drifting away
-is bad. The HUD line shows `near <d> m`, `min <d> m` (episode best) and
-`prox <+v>` live; `--prox-gain 0` disables it. The 70 parked-car poses are
-cached once at startup.
+**Approach shaping (progress-only):** there is deliberately NO reward for
+being near a car — an earlier continuous closeness gradient (far/near
+scales) paid for hovering over the target and let altitude bobbing count
+as value, and it was removed. What remains is pure progress: each 0.5 s
+tick that **closes** horizontal distance to the current target car by at
+least `--closing-min` meters pulses `--closing-gain` per meter (capped at
+0.5). Hovering and retreating send nothing — the brain's relative reward
+shaping (τ = 12 s) turns the pulses into "my approach produced this."
+Car-touch events stay the jackpot; `near <d> m` / `min <d> m` in the HUD
+are telemetry only, no reward attached. The 70 parked-car poses are
+cached once at startup; `--prox-gain` and the gradient knobs are gone.
 
 **Car-crash training recipe** — to train the brain to crash into cars:
 
@@ -597,6 +600,54 @@ scripts/              connectome extractor, bootstrap downloader (get_brain.py),
                       protocol test client, benchmarks
 state/                learned weights (created at runtime, not in git)
 ```
+
+## Human command interface (simple commands)The fly-eye viewer server doubles as a command endpoint — curriculum and
+training signals only, never actuator values (the connectome keeps 100% of
+the flying):
+
+```bash
+curl -X POST http://localhost:8795/cmd -d '{"cmd":"car 3"}'   # target car #3
+curl -X POST http://localhost:8795/cmd -d '{"cmd":"new car"}' # random new target
+curl -X POST http://localhost:8795/cmd -d '{"cmd":"reset"}'   # respawn now
+curl -X POST http://localhost:8795/cmd -d '{"cmd":"hover"}'   # pause brain 5 s
+curl -X POST http://localhost:8795/cmd -d '{"cmd":"go"}'      # resume
+curl -X POST http://localhost:8795/cmd -d '{"cmd":"jackpot off"}'
+curl http://localhost:8795/status                              # live JSON state
+```
+
+`GET /status` returns altitude, distance to the current target car, target
+index, car touches, collisions, and live dopamine — enough for a dashboard
+or a future natural-language front-end that compiles sentences into these
+same primitives.
+
+### Readout normalization (engine)
+
+Map entries accept `"norm": {"span": s, "center": c}` — a range
+calibration that rescales the signal so `s` maps to the full [-1,1] stick,
+after subtracting `c`. **`center` is a number you calibrate** (or `true`
+meaning 0.5): it must be the signal's *measured resting value* — read
+`poolsRaw` from `/telemetry` and use the channel's quiescent integral.
+A wrong center rails the channel against the client's clamp, and a railed
+channel is a learning dead end: no event gradient, no dopamine, no thrust.
+(The "thrust is always 0" bug was exactly this — pool weights ratcheted to
+the floor under a center guessed at 0.5, the raw channel went to −1, and
+web clients clamp throttle to ≥ 0, so the body sat at zero thrust where no
+reward can be earned. Pools now also carry their own much lower weight
+floor `w_floor` (0.1) instead of the synapse floor `w_min` (0.6), so a
+fully-depressed pool goes near-silent — neutral stick, recoverable — rather
+than pinned at a rail.) It is per-entry, in `config/profiles/*.json`, and
+changes no timing or sign — the circuit keeps ownership of every
+deflection. The drone profile normalizes **only the throttle channel**
+(`pool0`, span 0.45, center 0.3 ≈ its measured rest): rectified pools are
+unipolar, so without a norm their output is a large constant — the gain and
+offset then map the *deflections around rest* onto the stick with the
+calibrated hover at the configured default. Attitude channels
+(`poolA-poolB` differentials) deliberately carry **no** norm — they rest at
+0 already, the per-episode trim centers them, and a guessed span saturates
+the tanh into pinned full-rate sticks (the "spins to face one direction"
+regression; measured differentials run 0.25–0.4, far above the 0.2 span
+that caused it). If you ever re-add it, measure the live differential span
+first.
 
 ## Keys (demo clients)
 

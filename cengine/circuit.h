@@ -27,7 +27,12 @@ typedef struct {
     float tau_elig_ms;    /* eligibility trace window */
     float tau_dopa_ms;    /* dopamine decay */
     float a_ltp, a_ltd;   /* learning rates */
-    float w_min, w_max;   /* multiplicative weight bounds */
+    float w_min, w_max;   /* multiplicative weight bounds (synapses + pools) */
+    float w_floor;        /* POOL-only lower bound << w_min: a fully-depressed
+                           * pool goes near-silent (≈0 drive) but keeps
+                           * headroom to re-potentiate; clamping pools at
+                           * w_min pinned the rectified readout at its rail
+                           * and starved the reward loop (thrust=0 bug) */
     float k_scale;        /* Turrigiano per learning step */
     int scale_every;      /* learning steps between scaling passes */
     uint32_t seed;        /* xorshift state */
@@ -142,6 +147,8 @@ typedef struct {
      * the runtime points fb_runtime_pools at it and configures it. */
     FbPool *pools;
     int n_pools;
+    float pool_lr;        /* pool weight learning rate (a_ltp per second;
+                          * readout.poolLr, default 0.08) */
 
     /* delay queues: flat id arrays; slot[k] delivers after k+1 more ticks */
     int64_t *pend0_cur, *pend0_next;
@@ -236,10 +243,11 @@ typedef struct {
     int every;        /* >0: take one of every k */
     int split_lr;     /* 1: partition by connectome side (pool 0 = left) */
     int which;        /* which half for split_lr (0 = left, 1 = right) */
+    float lr_scale;   /* per-pool learning-rate multiplier (default 1.0) */
 } FbPoolCfg;
 
 int fb_pools_configure(FbCircuit *n, const FbPoolCfg *cfgs, int n_cfgs,
-                       int integrate_ms, int learn);
+                       int integrate_ms, int learn, float pool_lr);
 FbPool *fb_runtime_pools(FbCircuit *n);   /* live pool array (or NULL) */
 int fb_pools_count(const FbCircuit *n);
 /* current leaky integrals (called with the runtime lock held) */

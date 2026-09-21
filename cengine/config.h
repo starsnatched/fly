@@ -18,6 +18,11 @@ typedef struct {
     char signal[32];
     float gain, offset;
     int shape;                /* 0 = linear, 1 = tanh */
+    int has_norm;             /* 1 = rescale to [-1,1] (readout norm) */
+    float norm_span;          /* half-range pre-normalization */
+    float norm_center;        /* subtracted first: bool true = 0.5 (unipolar
+                               * pools), a number = that value (measured
+                               * resting integral), absent = 0 */
 } FbMapEntry;
 
 #define FB_MAX_MAP 32
@@ -34,6 +39,7 @@ typedef struct {
     int every;        /* >1: one neuron of every k (ascending id order) */
     int split_lr;     /* 1: partition by connectome side (which: 0 left) */
     int which;        /* split half selector (0 = left, 1 = right) */
+    float lr_scale;   /* per-pool learning-rate multiplier (default 1.0) */
 } FbPoolEntry;
 
 typedef struct {
@@ -68,6 +74,8 @@ typedef struct {
     int n_pools;
     int pool_integrate_ms;   /* leaky-accumulator window (default 80 ms) */
     int pool_learn;          /* plastic pool weights (default: engine learning) */
+    float pool_lr;           /* pool weight learning rate (readout.poolLr,
+                             * default 0.08 — the historical hard-coded value) */
     /* actuators (channel order matters: it defines the WS action frame) */
     char channels[8][32];
     float ch_lo[8], ch_hi[8], ch_slew[8], ch_default[8];

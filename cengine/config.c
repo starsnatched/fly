@@ -13,6 +13,28 @@ static int parse_map_entry(FbMapEntry *e, const FbJson *m) {
     e->offset = (float)fb_json_num(m, "offset", 0.0);
     const char *shape = fb_json_str(m, "shape", "");
     e->shape = strcmp(shape, "tanh") == 0 ? 1 : 0;
+    /* "norm": {"span": s, "center": c} — readout normalization.
+     * Rescales the signal so span s maps to the full [-1,1] stick, after
+     * subtracting the center: "center": true = 0.5 (unipolar rectified
+     * pool signals), a NUMBER = that value (calibrate it to the signal's
+     * measured resting level — a wrong center rails the channel and the
+     * body can then never earn positive dopamine), absent = 0. */
+    const FbJson *nm = fb_json_get(m, "norm");
+    e->has_norm = 0;
+    if (nm && nm->type == FB_JSON_OBJ) {
+        double span = fb_json_num(nm, "span", 0.0);
+        if (span > 1e-6f) {
+            e->has_norm = 1;
+            e->norm_span = (float)span;
+            const FbJson *ct = fb_json_get(nm, "center");
+            if (ct && ct->type == FB_JSON_NUM)
+                e->norm_center = (float)ct->num;
+            else if (ct && ct->type == FB_JSON_BOOL)
+                e->norm_center = ct->b ? 0.5f : 0.0f;
+            else
+                e->norm_center = 0.0f;
+        }
+    }
     return e->channel[0] && e->signal[0];
 }
 
@@ -102,6 +124,7 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
                 const char *split = fb_json_str(p, "split", "");
                 pe->split_lr = strcmp(split, "lr") == 0 ? 1 : 0;
                 pe->which = (int)fb_json_num(p, "which", 0.0);
+                pe->lr_scale = (float)fb_json_num(p, "lrScale", 1.0);
                 if (pe->group[0]) kept++;
             }
             cfg->n_pools = kept;
@@ -110,6 +133,8 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
             (int)fb_json_num(ro, "integrateMs", (double)cfg->pool_integrate_ms);
         cfg->pool_learn =
             fb_json_bool(ro, "learn", cfg->pool_learn ? true : false) ? 1 : 0;
+        cfg->pool_lr =
+            (float)fb_json_num(ro, "poolLr", (double)cfg->pool_lr);
     }
 
     const FbJson *act = fb_json_get(root, "actuators");
@@ -167,6 +192,7 @@ int fb_config_load(FbConfig *cfg, const char *path, const char *profile_path) {
     cfg->n_pools = 0;
     cfg->pool_integrate_ms = 80;
     cfg->pool_learn = 1;
+    cfg->pool_lr = 0.08f;
     cfg->n_channels = 4;
     snprintf(cfg->channels[0], 32, "throttle");
     snprintf(cfg->channels[1], 32, "pitch");
@@ -308,10 +334,11 @@ void fb_config_apply_profile_to_runtime(FbConfig *cfg, FbRuntime *rt,
             pcfg[npcfg].every = cfg->pools[i].every;
             pcfg[npcfg].split_lr = cfg->pools[i].split_lr;
             pcfg[npcfg].which = cfg->pools[i].which;
+            pcfg[npcfg].lr_scale = cfg->pools[i].lr_scale;
             npcfg++;
         }
         fb_pools_configure(rt->net, pcfg, npcfg,
-                           cfg->pool_integrate_ms, cfg->pool_learn);
+                           cfg->pool_integrate_ms, cfg->pool_learn, cfg->pool_lr);
         if (had > 0 && nw > 0) fb_pools_import(rt->net, nm, wv, nw);
         free(wv);
         free(nm);

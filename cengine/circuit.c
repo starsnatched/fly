@@ -463,6 +463,11 @@ FbCircuit *fb_circuit_new(const FbConnectome *c, const FbParams *p) {
     n->sim_ms = 0;
     n->last_dn_l = n->last_dn_r = 0;
     n->touch_blast_mV = 0.0f;
+    n->proprio_n = 0;
+    n->proprio_gain_mV = 1.2f;
+    memset(n->proprio_state, 0, sizeof(n->proprio_state));
+    memset(n->proprio_vel, 0, sizeof(n->proprio_vel));
+    for (int i = 0; i < 32; i++) n->proprio_phase[i] = -1.0f; /* not yet sampled */
     return n;
 }
 
@@ -535,6 +540,40 @@ void fb_apply_reward(FbCircuit *n, float r) {
 void fb_circuit_sensory_burst(FbCircuit *n, float mv) {
     if (mv == 0.0f) return;
     n->touch_blast_mV = mv;
+}
+
+/* ------------------------------------------------------- proprioception */
+
+/* Deterministic per-DoF hash -> [0,1): gives each joint a fixed private
+ * phase within the sensory population, so joint k's receptor current lives
+ * on a distinct sinusoidal carrier. Joints that happen to sit at the same
+ * angle still produce DIFFERENT population patterns (and phase walks with
+ * |state| so the carrier is informative, not just decorative). */
+static float proprio_phase_of(int i, float state) {
+    uint32_t h = (uint32_t)(i * 2654435761u);
+    h ^= h >> 13; h *= 0x9E3779B9u; h ^= h >> 16;
+    float base = (float)(h & 0xFFFFu) / 65536.0f;
+    return fmodf(base + 0.5f * (state + 1.0f), 1.0f);
+}
+
+void fb_circuit_proprio_set(FbCircuit *n, int ndof, const float *state,
+                            const float *vel) {
+    if (ndof > 32) ndof = 32;
+    for (int i = 0; i < ndof; i++) {
+        float s = state[i], v = 0.0f;
+        if (!isfinite(s)) continue;
+        if (s > 1.0f) s = 1.0f;
+        if (s < -1.0f) s = -1.0f;
+        if (vel && isfinite(vel[i])) {
+            v = vel[i];
+            if (v > 1.0f) v = 1.0f;
+            if (v < -1.0f) v = -1.0f;
+        }
+        n->proprio_state[i] = s;
+        n->proprio_vel[i] = v;
+        n->proprio_phase[i] = proprio_phase_of(i, s);
+    }
+    n->proprio_n = ndof;
 }
 
 /* EXTERNAL signals (environment reward, REST/WS injections) enter only as a
@@ -629,6 +668,23 @@ int fb_tick(FbCircuit *n, const float *rgb_l, const float *rgb_r, int gw, int gh
          * behavior (VNC/DNs) and reward circuits; nothing is scripted. */
         if (n->touch_blast_mV != 0.0f && n->sensory_set[i])
             base += n->touch_blast_mV;
+        /* proprioception: patterned joint-receptor current across the
+         * sensory population — the body's own state as an input, like the
+         * chordotonal organs reporting leg posture. Each DoF drives a
+         * distinct spatial carrier (phase from its hash) so per-joint state
+         * is separable downstream; velocity receptors add the fast
+         * transient on top (primary spindles). */
+        if (n->proprio_n > 0 && n->sensory_set[i]) {
+            const float tick01 = (float)(n->sim_ms * (1.0 / 500.0));
+            float pr = 0.0f;
+            for (int k = 0; k < n->proprio_n; k++) {
+                float w = (n->proprio_state[k] + 0.5f * n->proprio_vel[k])
+                          * n->proprio_gain_mV;
+                if (w == 0.0f) continue;
+                pr += w * sinf(6.2831853f * (n->proprio_phase[k] + tick01));
+            }
+            base += pr * (1.0f / (float)(n->proprio_n > 3 ? n->proprio_n : 3));
+        }
         n->i_ext[i] = base;
     }
 
@@ -1160,13 +1216,19 @@ int fb_pools_configure(FbCircuit *n, const FbPoolCfg *cfgs, int n_cfgs,
                     seen++;
                 }
             }
-        } else if (pc->every > 1) {
-            for (int j = 0; j < n->c->N; j++) {
-                if (n->grp[j] == g && (j % pc->every) == 0) ids[m++] = j;
-            }
         } else {
-            for (int j = 0; j < n->c->N; j++)
-                if (n->grp[j] == g) ids[m++] = j;
+            /* every/whole-group selection, optionally sliced by offset/count
+             * so several pools can tile the group DISJOINTLY (one pool per
+             * DoF: pool j owns members [offset, offset+count)) */
+            int every = pc->every > 1 ? pc->every : 1;
+            int skipped = 0, taken = 0;
+            for (int j = 0; j < n->c->N && (pc->count <= 0 || taken < pc->count);
+                 j++) {
+                if (n->grp[j] != g || (j % every) != 0) continue;
+                if (skipped++ < pc->offset) continue;
+                ids[m++] = j;
+                taken++;
+            }
         }
         if (m <= 0) { free(ids); continue; }
         p[built].ids = ids;

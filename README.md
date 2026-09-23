@@ -395,6 +395,93 @@ channel values), `--yaw-tau 2.0` (heading-still smoothing),
 `--no-assist`, `--eyes fly|stereo|center`, `--no-gfx`, `--viewer-port 0`,
 `--reward alt`.
 
+## Hexapod embodiment (MuJoCo, physics-real walker)
+
+For a legged body the same brain drives an 18-DoF insect robot in
+[MuJoCo](https://mujoco.org): six 3-DoF legs (coxa/femur/tibia), a
+compound-eye stereo head, and a walled obstacle arena with a red food
+puck as the training target.
+
+```
+MuJoCo world ──eyeL/eyeR 192x108 + body state──▶ connectome brain (:8793)
+servo ctrl  ◀──── 18 joint channels, one per servo ◀────────────────────┘
+```
+
+**Run it:**
+
+```bash
+uv pip install --python .venv/Scripts/python.exe mujoco   # one-time
+.venv/Scripts/python.exe scripts/build_hexapod_world.py   # one-time: converts the
+                                                          # preconfigured kit into the arena
+bash scripts/start_hexapod_stack.sh                       # brain + walker
+```
+
+Open `http://localhost:8795` for the chase camera + live status; the
+walker brain's REST surface is `:8794`. The hexapod runs its own
+connectome instance with its own memory (`state/hexa-memory.json`) —
+flight memories are untouched. `--no-viewer`, `--wind-gain 0`
+(disable the exploration wind) and the other bridge flags work as
+documented below.
+
+**The robot.** Not a hand-made model: `config/hexapod_assets/` holds a
+preconfigured PiHexa-style hexapod kit (mesh-accurate printed chassis,
+servo brackets, 6× coxa/femur/tibia, 18 hobby servos) that
+`scripts/build_hexapod_world.py` converts into the walking arena — meter
+units, one rigid torso, the kit's exact leg kinematics verified against
+the source to sub-micron foot parity, plus rubber foot pads, touch
+sensors, eye/chase cameras, walls, rocks and the red goal puck. The
+source's ±62.8° joint limits are a sim artifact; the conversion widens
+them to the ±90° the real servos deliver.
+
+**Per-joint control — every servo is the brain's.** There is no gait
+library and no directional abstraction. The body profile
+(`config/profiles/hexapod.json`) declares 18 DISJOINT motor pools — the
+815-neuron descending-motor group is tiled in id order, one pool of 45
+neurons per servo — and maps pool k to channel `servo:k`, which the
+bridge writes straight into that joint's MuJoCo position servo. Walking
+is whatever the circuit's plastic pool weights make of those 18
+channels. The engine gained the machinery for this: the 8-pool cap is
+now 32, pools can be disjoint `offset`/`count` slices, and profiles may
+declare up to 32 actuator channels.
+
+**Proprioception — the brain feels its own joints.** The bridge streams
+all 18 joint angles and velocities (normalized to the ±90° servo range)
+in every `state` frame; the engine turns them into patterned
+joint-receptor currents across the sensory population (position tonic +
+velocity transient, per-DoF carrier phase — chordotonal-organ style), so
+posture and self-motion are inputs the circuit can learn from, exactly
+like vision and touch. Tune with `sensors.proprio` (`gainMv`, `dof`) in
+the profile; live values are on `/telemetry` as `jointN`/`joints`.
+
+**Embodiment honesty: state is body-measurable ONLY.** The `state` frame
+carries joint encoders plus, on a real chassis contact, a one-shot
+`contact` nerve event (what a bumper sensor delivers). Altitude, speed,
+vy and collision *flags* are simulator knowledge and are neither sent
+nor accepted by the engine — the brain must infer motion from optic flow
+and proprioception, as a real fly does. Episode events (puck reached,
+obstacle touched) still reach the brain as rewards, not state.
+
+**Forward-facing stereo vision.** The compound eyes converge ±20° with a
+10° down-pitch and look along the body's +x axis — the same direction the
+yaw readout and walk direction use — so the robot sees where it's going,
+with its front legs at the bottom of frame like a real insect. Note the
+MJCF camera-orientation gotcha fixed along the way: euler ZYX composition
+left the original pair rolled and sideways; the world now carries
+direct look-at quaternions, and the skybox's lower gradient is
+ground-colored so below-horizon pixels never read as sky.
+
+**Training loop.** The AirSim bridge's discipline carries over intact:
+per-episode frozen auto-trim (now 18 channels), per-joint command
+smoothing (`--stick-tau`), the dopa-aware stun protocol, stagnation
+pressure and progress-only shaping. The puck plays the parked car:
+touching it pays +2.5, each 0.5 s tick that closes on it pulses a small
+reward, rocks and walls punish −2.5 and hold the scene until the
+dopamine tail recovers. The exploration wind is now JOINT-SPACE motor
+babble — a slow random walk on every servo target that the brain's
+deflections add to (and that yields inside the puck's near zone) — so
+the reactive circuit keeps producing the optic flow, touches and
+approaches its R-STDP learns from.
+
 ## Talking to the brain
 
 Everything lives behind one WebSocket (`/stream`) plus a small REST surface.
@@ -597,7 +684,9 @@ scripts/              connectome extractor, bootstrap downloader (get_brain.py),
                       AirSim installer (get_airsim.py) + AirSim bridge
                       (airsim_drone.py, with vendored airsim client and a
                       modern msgpack-RPC shim in scripts/msgpackrpc/),
-                      protocol test client, benchmarks
+                      MuJoCo hexapod embodiment (build_hexapod_world.py converts
+                      the preconfigured kit in config/hexapod_assets/, hexapod_sim.py
+                      bridge) + stack launcher, protocol test client, benchmarks
 state/                learned weights (created at runtime, not in git)
 ```
 

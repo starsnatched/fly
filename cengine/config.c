@@ -74,6 +74,12 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
         if (touch) {
             cfg->touch_gain = (float)fb_json_num(touch, "burstMv", (double)cfg->touch_gain);
         }
+        const FbJson *prop = fb_json_get(sens, "proprio");
+        if (prop) {
+            cfg->proprio_gain_mV =
+                (float)fb_json_num(prop, "gainMv", (double)cfg->proprio_gain_mV);
+            cfg->proprio_dof = (int)fb_json_num(prop, "dof", (double)cfg->proprio_dof);
+        }
         const FbJson *rng = fb_json_get(sens, "scalarRanges");
         if (rng) {
             const FbJson *a;
@@ -114,16 +120,19 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
          * actuator channel named "pool<i>" (declare it in actuators). */
         const FbJson *pools = fb_json_get(ro, "pools");
         if (pools && pools->type == FB_JSON_ARR) {
-            int n = pools->n > 8 ? 8 : pools->n;
+            int n = pools->n > 32 ? 32 : pools->n;
             int kept = 0;
             for (int i = 0; i < n; i++) {
                 const FbJson *p = pools->items[i];
                 FbPoolEntry *pe = &cfg->pools[kept];
-                snprintf(pe->group, sizeof(pe->group), "%s", fb_json_str(p, "group", ""));
+                snprintf(pe->group, sizeof(pe->group), "%s",
+                         fb_json_str(p, "group", "motor"));   /* default: descending motor group */
                 pe->every = (int)fb_json_num(p, "every", 0.0);
                 const char *split = fb_json_str(p, "split", "");
                 pe->split_lr = strcmp(split, "lr") == 0 ? 1 : 0;
                 pe->which = (int)fb_json_num(p, "which", 0.0);
+                pe->offset = (int)fb_json_num(p, "offset", 0.0);
+                pe->count = (int)fb_json_num(p, "count", 0.0);
                 pe->lr_scale = (float)fb_json_num(p, "lrScale", 1.0);
                 if (pe->group[0]) kept++;
             }
@@ -141,7 +150,7 @@ static void copy_json_or_default(FbConfig *cfg, FbJson *root) {
     if (act) {
         const FbJson *chs = fb_json_get(act, "channels");
         if (chs && chs->type == FB_JSON_ARR) {
-            int n = chs->n > 8 ? 8 : chs->n;
+            int n = chs->n > 32 ? 32 : chs->n;
             for (int i = 0; i < n; i++) {
                 const FbJson *ch = chs->items[i];
                 snprintf(cfg->channels[i], 32, "%s", fb_json_str(ch, "name", "ch"));
@@ -187,6 +196,8 @@ int fb_config_load(FbConfig *cfg, const char *path, const char *profile_path) {
     cfg->range_clr[0] = 0; cfg->range_clr[1] = 60;
     cfg->tau_scale = 9.0f;
     cfg->touch_gain = 6.0f;
+    cfg->proprio_gain_mV = 1.2f;
+    cfg->proprio_dof = 0;
     cfg->dn_hz_scale = 8.0f;
     cfg->n_map = 0;
     cfg->n_pools = 0;
@@ -326,7 +337,7 @@ void fb_config_apply_profile_to_runtime(FbConfig *cfg, FbRuntime *rt,
         double *wv = NULL;
         int nw = 0;
         int had = nm ? fb_pools_export(rt->net, nm, 4096, &wv, &nw) : 0;
-        FbPoolCfg pcfg[8];
+        FbPoolCfg pcfg[32];
         int npcfg = 0;
         for (int i = 0; i < cfg->n_pools; i++) {
             snprintf(pcfg[npcfg].group, sizeof(pcfg[npcfg].group), "%s",
@@ -335,6 +346,8 @@ void fb_config_apply_profile_to_runtime(FbConfig *cfg, FbRuntime *rt,
             pcfg[npcfg].split_lr = cfg->pools[i].split_lr;
             pcfg[npcfg].which = cfg->pools[i].which;
             pcfg[npcfg].lr_scale = cfg->pools[i].lr_scale;
+            pcfg[npcfg].offset = cfg->pools[i].offset;
+            pcfg[npcfg].count = cfg->pools[i].count;
             npcfg++;
         }
         fb_pools_configure(rt->net, pcfg, npcfg,

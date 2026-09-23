@@ -1,0 +1,87 @@
+{
+  "readout": {
+    "dnHzScale": 8.0,
+    "integrateMs": 90,
+    "learn": true,
+    "poolLr": 0.8,
+    "pools": [
+      { "offset": 0,    "count": 45 },
+      { "offset": 45,   "count": 45 },
+      { "offset": 90,   "count": 45 },
+      { "offset": 135,  "count": 45 },
+      { "offset": 180,  "count": 45 },
+      { "offset": 225,  "count": 45 },
+      { "offset": 270,  "count": 45 },
+      { "offset": 315,  "count": 45 },
+      { "offset": 360,  "count": 45 },
+      { "offset": 405,  "count": 45 },
+      { "offset": 450,  "count": 45 },
+      { "offset": 495,  "count": 45 },
+      { "offset": 540,  "count": 45 },
+      { "offset": 585,  "count": 45 },
+      { "offset": 630,  "count": 45 },
+      { "offset": 675,  "count": 45 },
+      { "offset": 720,  "count": 45 },
+      { "offset": 765,  "count": 45 }
+    ],
+    "map": [
+      { "channel": "servo:1",  "signal": "pool0",  "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:2",  "signal": "pool1",  "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:3",  "signal": "pool2",  "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:4",  "signal": "pool3",  "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:5",  "signal": "pool4",  "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:6",  "signal": "pool5",  "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:7",  "signal": "pool6",  "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:8",  "signal": "pool7",  "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:9",  "signal": "pool8",  "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:10", "signal": "pool9",  "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:11", "signal": "pool10", "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:12", "signal": "pool11", "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:13", "signal": "pool12", "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:14", "signal": "pool13", "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:15", "signal": "pool14", "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:16", "signal": "pool15", "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:17", "signal": "pool16", "gain": 1.0, "offset": 0.0, "shape": "tanh" },
+      { "channel": "servo:18", "signal": "pool17", "gain": 1.0, "offset": 0.0, "shape": "tanh" }
+    ]
+  },
+  "actuators": {
+    "channels": [
+      { "name": "servo:1",  "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.0, "default": 0.0 },
+      { "name": "servo:2",  "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:3",  "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:4",  "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.0, "default": 0.0 },
+      { "name": "servo:5",  "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:6",  "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:7",  "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.0, "default": 0.0 },
+      { "name": "servo:8",  "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:9",  "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:10", "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.0, "default": 0.0 },
+      { "name": "servo:11", "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:12", "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:13", "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.0, "default": 0.0 },
+      { "name": "servo:14", "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:15", "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:16", "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.0, "default": 0.0 },
+      { "name": "servo:17", "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 },
+      { "name": "servo:18", "lo": -1.5708, "hi": 1.5708, "slewPerS": 3.3, "default": 0.0 }
+    ]
+  },
+  "sensors": {
+    "visionHz": 120,
+    "eyes": { "count": 2, "leftId": 0, "rightId": 1 },
+    "touch": { "burstMv": 6.0, "holdMs": 40 },
+    "scalarRanges": {
+      "altitude": [0.0, 0.2],
+      "speed": [0.0, 0.5],
+      "vy": [-0.5, 0.5],
+      "clearance": [0.0, 1.0],
+      "tauScale": 9.0
+    }
+  },
+  "reward": {
+    "rewardGain": 0.3,
+    "shape": "relative",
+    "shapeTauS": 12.0
+  }
+}

@@ -39,6 +39,10 @@ typedef struct {
     int every;        /* >1: one neuron of every k (ascending id order) */
     int split_lr;     /* 1: partition by connectome side (which: 0 left) */
     int which;        /* split half selector (0 = left, 1 = right) */
+    int offset;       /* >0: start this many members into the selection
+                         (every/whole-group modes) — makes pools DISJOINT:
+                         pool j owns members [offset, offset+count) */
+    int count;        /* >0: take this many members from offset (cap) */
     float lr_scale;   /* per-pool learning-rate multiplier (default 1.0) */
 } FbPoolEntry;
 
@@ -62,6 +66,10 @@ typedef struct {
     /* mechanosensory (touch/collision) pathway */
     float touch_gain;         /* burst amplitude in mV of extra sensory current
                                  (decays with ~40 ms receptor kinetics) */
+    /* proprioception: per-DoF joint-state pathway (see circuit.h) */
+    float proprio_gain_mV;    /* max receptor current per DoF (default 1.2) */
+    int   proprio_dof;        /* expected DoF count (0 = accept whatever the
+                                 body streams, up to 32) */
     /* readout: DN rate normalization + the DECLARED decode map
      * (readout.map[]). There are no behavioral knobs: all behavior is the
      * circuit's own; the map only says which population a channel listens
@@ -70,15 +78,15 @@ typedef struct {
     FbMapEntry map[FB_MAX_MAP];
     int n_map;
     /* direct motor pools (readout.pools): neuron-level actuator channels */
-    FbPoolEntry pools[8];
+    FbPoolEntry pools[32];
     int n_pools;
     int pool_integrate_ms;   /* leaky-accumulator window (default 80 ms) */
     int pool_learn;          /* plastic pool weights (default: engine learning) */
     float pool_lr;           /* pool weight learning rate (readout.poolLr,
                              * default 0.08 — the historical hard-coded value) */
     /* actuators (channel order matters: it defines the WS action frame) */
-    char channels[8][32];
-    float ch_lo[8], ch_hi[8], ch_slew[8], ch_default[8];
+    char channels[32][32];
+    float ch_lo[32], ch_hi[32], ch_slew[32], ch_default[32];
     int n_channels;
     /* reward pathway (NO reward shaping: only how /reward scales into the
      * DAN excitability input; the bias decays inside the circuit) */

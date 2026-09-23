@@ -1,0 +1,41 @@
+{
+  "engine": {
+    "binary": "data/fly-brain-full.bin",
+    "gScale": 0.3,
+    "tgtBudget": 36.0,
+    "phTonic": 5.0,
+    "phOpticGain": 2.0,
+    "emdGain": 10.0,
+    "danModGain": 0.6,
+    "danTonicMv": 1.5,
+    "dopaGain": 0.09,
+    "danBaseTauS": 8.0,
+    "learning": true,
+    "tickCostSeedMs": 30.0
+  },
+  "simSpeed": 1.0,
+  "maxBioMsPerTick": 20.0,
+  "autosaveS": 5.0,
+  "memoryPath": "state/hexa-memory.json",
+  "sensors": {
+    "visionHz": 120,
+    "eyes": { "count": 2, "leftId": 0, "rightId": 1 },
+    "touch": { "burstMv": 6.0 },
+    "scalarRanges": {
+      "altitude": [0.0, 0.15],
+      "speed": [0.0, 0.5],
+      "vy": [-0.5, 0.5],
+      "clearance": [0.0, 1.0],
+      "tauScale": 9.0
+    }
+  },
+  "reward": {
+    "rewardGain": 0.3,
+    "shape": "relative",
+    "shapeTauS": 12.0
+  },
+  "network": {
+    "wsPort": 8793,
+    "restPort": 8794
+  }
+}

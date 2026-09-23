@@ -26,6 +26,12 @@ typedef struct {
     int collision;
     double coll_hold_s; /* bumper memory: contact-range window after a hit */
 
+    /* proprioceptive state (per-DoF, coalescing slot like img/grid) */
+    float joint_state[32];
+    float joint_vel[32];
+    int   joint_n;
+    int   joint_dirty;
+
     /* downsampled float grids for the circuit (lam_w x lam_h x 3) */
     float *sample;
     int sample_cap;
@@ -44,7 +50,7 @@ typedef struct FbRuntime {
     FbSensors sens;
 
     /* actuator state */
-    FbChannel ch[8];
+    FbChannel ch[32];
     int n_channels;
     uint64_t actions_serial;
 
@@ -84,6 +90,14 @@ void fb_runtime_ingest_frame(FbRuntime *rt, int eye, int w, int h, const uint8_t
 void fb_runtime_ingest_grid(FbRuntime *rt, int eye, int w, int h, const float *rgb);
 void fb_runtime_ingest_state(FbRuntime *rt, float altitude, float speed, float vy,
                              float clearance, int collision);
+
+/* per-DoF body joint state (proprioception): state/vel arrays in [-1,1] */
+void fb_runtime_ingest_joints(FbRuntime *rt, int n, const float *state,
+                              const float *vel);
+
+/* body-owned contact event (bumper / chassis contact nerve) -> triggers the
+ * mechanosensory burst pathway on the next loop pass */
+void fb_runtime_touch_burst(FbRuntime *rt);
 void fb_runtime_set_learning(FbRuntime *rt, int on);
 void fb_runtime_wipe_memory(FbRuntime *rt);
 int fb_runtime_import_memory(FbRuntime *rt, const FbJson *mem);

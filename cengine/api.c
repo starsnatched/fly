@@ -286,12 +286,30 @@ static void handle_json_msg(FbApi *api, WsClient *c, char *text, size_t len) {
         fb_str_free(&s);
         free(tel);
     } else if (strcmp(type, "state") == 0) {
-        fb_runtime_ingest_state(api->rt,
-                                (float)fb_json_num(obj, "altitude", 2.0),
-                                (float)fb_json_num(obj, "speed", 0.0),
-                                (float)fb_json_num(obj, "vy", 0.0),
-                                (float)fb_json_num(obj, "clearance", 30.0),
-                                fb_json_bool(obj, "collision", false) ? 1 : 0);
+        /* proprioception: joints = [[state, vel], ...] in normalized [-1,1].
+         * The state frame carries ONLY body-measurable signals: joint
+         * encoders plus an optional body-contact event (a real bumper
+         * nerve). Altitude/speed/vy are simulator knowledge and are NOT
+         * accepted. */
+        const FbJson *jarr = fb_json_get(obj, "joints");
+        if (jarr && jarr->type == FB_JSON_ARR && jarr->n > 0) {
+            int n = jarr->n;
+            if (n > 32) n = 32;
+            float jstate[32], jvel[32];
+            for (int i = 0; i < n; i++) {
+                const FbJson *e = jarr->items[i];
+                jstate[i] = 0.0f; jvel[i] = 0.0f;
+                if (e->type == FB_JSON_NUM) {
+                    jstate[i] = (float)e->num;
+                } else if (e->type == FB_JSON_ARR && e->n >= 1) {
+                    jstate[i] = (float)e->items[0]->num;
+                    if (e->n >= 2) jvel[i] = (float)e->items[1]->num;
+                }
+            }
+            fb_runtime_ingest_joints(api->rt, n, jstate, jvel);
+        }
+        if (fb_json_bool(obj, "contact", false))
+            fb_runtime_touch_burst(api->rt);
     } else if (strcmp(type, "control") == 0) {
         const FbJson *v = fb_json_get(obj, "learning");
         if (v && v->type == FB_JSON_BOOL)

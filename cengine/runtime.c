@@ -144,7 +144,7 @@ enum {
  *   { "channel": "throttle", "signal": "pool0", "gain": .., "offset": .. }
  * Population signals and pool signals can be mixed freely in one map. */
 #define SIG_POOL_BASE SIG_COUNT
-#define SIG_POOL_MAX 8
+#define SIG_POOL_MAX 32
 
 static const char *SIG_NAMES[SIG_COUNT] = {
     "dnDrive", "motorDrive", "dnSteer",
@@ -462,6 +462,8 @@ FbRuntime *fb_runtime_new(const FbConfig *cfg) {
     p.dan_tonic_mv = cfg->dan_tonic_mv;
     rt->net = fb_circuit_new(rt->con, &p);
     if (!rt->net) { fb_connectome_free(rt->con); free(rt); return NULL; }
+    rt->net->proprio_gain_mV = cfg->proprio_gain_mV > 0.0f
+        ? cfg->proprio_gain_mV : 1.2f;
     rt->n_channels = cfg->n_channels;
     for (int i = 0; i < cfg->n_channels; i++) {
         snprintf(rt->ch[i].name, sizeof(rt->ch[i].name), "%s", cfg->channels[i]);
@@ -490,15 +492,17 @@ FbRuntime *fb_runtime_new(const FbConfig *cfg) {
      * (when the memory file already carries pool weights) wins; a fresh
      * file gets its weights back-filled from disk here. */
     if (cfg->n_pools > 0) {
-        FbPoolCfg pcfg[8];
+        FbPoolCfg pcfg[SIG_POOL_MAX];
         int npcfg = 0;
-        for (int i = 0; i < cfg->n_pools && npcfg < 8; i++) {
+        for (int i = 0; i < cfg->n_pools && npcfg < SIG_POOL_MAX; i++) {
             snprintf(pcfg[npcfg].group, sizeof(pcfg[npcfg].group), "%s",
                      cfg->pools[i].group);
             pcfg[npcfg].every = cfg->pools[i].every;
             pcfg[npcfg].split_lr = cfg->pools[i].split_lr;
             pcfg[npcfg].which = cfg->pools[i].which;
             pcfg[npcfg].lr_scale = cfg->pools[i].lr_scale;
+            pcfg[npcfg].offset = cfg->pools[i].offset;
+            pcfg[npcfg].count = cfg->pools[i].count;
             npcfg++;
         }
         int built = fb_pools_configure(rt->net, pcfg, npcfg, cfg->pool_lr,
@@ -621,9 +625,16 @@ static void *loop_main(void *arg)
         }
         if (one_eye) { rgb[1] = rgb[0]; rt->sens.samp_ok[1] = rt->sens.samp_ok[0]; }
 
+        /* proprioception: push latest joint state into the circuit */
+        if (rt->sens.joint_dirty && rt->sens.joint_n > 0) {
+            fb_circuit_proprio_set(net, rt->sens.joint_n,
+                                   rt->sens.joint_state, rt->sens.joint_vel);
+            rt->sens.joint_dirty = 0;
+        }
+
         /* readout + actuator slew: turn brain state into commands (~60 Hz) */
         {
-            float raw[8];
+            float raw[32];           /* FB_MAX_CH: profiles may declare up to 32 */
             readout_compute(rt, raw);
             actuators_apply(rt, raw, 1.0 / 60.0);
         }
@@ -711,6 +722,30 @@ void fb_runtime_ingest_grid(FbRuntime *rt, int eye, int w, int h, const float *r
     rt_unlock(rt);
 }
 
+void fb_runtime_ingest_joints(FbRuntime *rt, int n, const float *state,
+                              const float *vel) {
+    if (n <= 0 || !state) return;
+    if (n > 32) n = 32;
+    rt_lock(rt);
+    int nd = rt->cfg.proprio_dof;
+    if (nd > 0 && nd < n) n = nd;
+    memcpy(rt->sens.joint_state, state, (size_t)n * sizeof(float));
+    if (vel)
+        memcpy(rt->sens.joint_vel, vel, (size_t)n * sizeof(float));
+    else
+        memset(rt->sens.joint_vel, 0, (size_t)n * sizeof(float));
+    rt->sens.joint_n = n;
+    rt->sens.joint_dirty = 1;
+    rt_unlock(rt);
+}
+
+void fb_runtime_touch_burst(FbRuntime *rt) {
+    rt_lock(rt);
+    rt->sens.collision = 1;
+    rt->sens.coll_hold_s = 0.5;
+    rt_unlock(rt);
+}
+
 void fb_runtime_ingest_state(FbRuntime *rt, float altitude, float speed, float vy,
                              float clearance, int collision) {
     const FbConfig *cfg = &rt->cfg;
@@ -795,6 +830,9 @@ void fb_runtime_apply_reward(FbRuntime *rt, float r) {
 void fb_runtime_switch_profile(FbRuntime *rt, FbConfig *cfg,
                                const char *profile_path) {
     fb_config_apply_profile_to_runtime(cfg, rt, profile_path);
+    if (rt->net)
+        rt->net->proprio_gain_mV = cfg->proprio_gain_mV > 0.0f
+            ? cfg->proprio_gain_mV : 1.2f;
 }
 
 /* public hook for config.c: back-fill pool weights from the memory file
@@ -855,9 +893,9 @@ char *fb_runtime_telemetry_json(FbRuntime *rt) {
     fb_str_append_f(&s, net->dan_base_hz, 2);
     fb_str_append(&s, ",\"poolsRaw\":[");
     if (net->n_pools > 0) {
-        float pv[8];
-        fb_pools_snapshot(net, pv, 8);
-        for (int p = 0; p < net->n_pools && p < 8; p++) {
+        float pv[SIG_POOL_MAX];
+        fb_pools_snapshot(net, pv, SIG_POOL_MAX);
+        for (int p = 0; p < net->n_pools && p < SIG_POOL_MAX; p++) {
             if (p) fb_str_push(&s, ',');
             fb_str_append_f(&s, pv[p], 4);
         }
@@ -877,6 +915,20 @@ char *fb_runtime_telemetry_json(FbRuntime *rt) {
     fb_str_append_f(&s, rt->sens.clearance, 1);
     fb_str_append(&s, ",\"speed\":");
     fb_str_append_f(&s, rt->sens.speed, 2);
+    fb_str_append(&s, ",\"jointN\":");
+    fb_str_append_int(&s, rt->sens.joint_n);
+    if (rt->sens.joint_n > 0) {
+        fb_str_append(&s, ",\"joints\":[");
+        for (int j = 0; j < rt->sens.joint_n; j++) {
+            if (j) fb_str_push(&s, ',');
+            fb_str_append_f(&s, rt->sens.joint_state[j], 3);
+        }
+        fb_str_push(&s, ']');
+        fb_str_append(&s, ",\"jointVelSum\":");
+        float jv = 0.0f;
+        for (int j = 0; j < rt->sens.joint_n; j++) jv += fabsf(rt->sens.joint_vel[j]);
+        fb_str_append_f(&s, jv, 3);
+    }
     fb_str_append(&s, ",\"learning\":");
     fb_str_append(&s, rt->learning ? "true" : "false");
     fb_str_append(&s, ",\"memEdited\":");
@@ -901,8 +953,8 @@ char *fb_runtime_telemetry_json(FbRuntime *rt) {
 }
 
 int fb_runtime_actions_json(FbRuntime *rt, FbStr *out) {
-    FbChannel ch[8];
-    int n = fb_runtime_actions_copy(rt, ch, 8);
+    FbChannel ch[32];
+    int n = fb_runtime_actions_copy(rt, ch, 32);
     fb_str_append(out, "{\"channels\":{");
     for (int i = 0; i < n; i++) {
         if (i) fb_str_push(out, ',');
@@ -916,8 +968,8 @@ int fb_runtime_actions_json(FbRuntime *rt, FbStr *out) {
 
 /* binary action frame: u8 type=10, u16 nameLen, names JSON, then f32s */
 int fb_runtime_actions_binary(FbRuntime *rt, uint8_t *buf, int cap) {
-    FbChannel ch[8];
-    int n = fb_runtime_actions_copy(rt, ch, 8);
+    FbChannel ch[32];
+    int n = fb_runtime_actions_copy(rt, ch, 32);
     FbStr s;
     fb_str_init(&s);
     fb_str_push(&s, '[');

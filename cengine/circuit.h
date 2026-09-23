@@ -110,6 +110,18 @@ typedef struct {
     uint8_t *sensory_set;
     float touch_blast_mV;
 
+    /* proprioception: per-DoF body-joint state streamed by the embodiment.
+     * state[i] in [-1,1], phase[i] in [0,1). Receptors: position encodes as a
+     * tonic depolarization of the sensory population, patterned by the joint
+     * hash — like the locust femoral chordotonal organ reporting leg angle
+     * (squash == stretch). dstate/dt (velocity receptors) add a fast transient
+     * on top — primary spindles fire on velocity, not position. */
+    float proprio_state[32];
+    float proprio_vel[32];
+    float proprio_phase[32];
+    int   proprio_n;
+    float proprio_gain_mV;   /* max tonic drive per DoF (default 1.2 mV) */
+
     /* DAN pathway */
     int64_t *dan_idx;
     int dan_n;
@@ -202,6 +214,11 @@ void fb_learn_step(FbCircuit *n);
 
 void fb_apply_reward(FbCircuit *n, float r);
 void fb_circuit_sensory_burst(FbCircuit *n, float mv);
+
+/* proprioceptive update: per-DoF joint state from the body. Copies into the
+ * circuit; the tick loop patterns it into sensory-population drive. */
+void fb_circuit_proprio_set(FbCircuit *n, int ndof, const float *state,
+                            const float *vel);
 void fb_apply_dan_bias(FbCircuit *n, float r);
 void fb_set_learning(FbCircuit *n, int on);
 
@@ -243,6 +260,8 @@ typedef struct {
     int every;        /* >0: take one of every k */
     int split_lr;     /* 1: partition by connectome side (pool 0 = left) */
     int which;        /* which half for split_lr (0 = left, 1 = right) */
+    int offset;       /* >0: skip this many members first (disjoint slices) */
+    int count;        /* >0: take at most this many members (slice cap) */
     float lr_scale;   /* per-pool learning-rate multiplier (default 1.0) */
 } FbPoolCfg;
 

@@ -1,0 +1,166 @@
+<mujoco model="Hexapod">
+  <visual>
+    <global offwidth="1280" offheight="720" />
+  </visual>
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="1 1 1" rgb2=".45 .52 .38" width="256" height="256" />
+    <mesh name="upper" scale="0.001 0.001 0.001" file="hexapod_assets/Upper Chassis.stl" />
+    <mesh name="lower" scale="0.001 0.001 0.001" file="hexapod_assets/Lower Chassis.stl" />
+    <mesh name="coxa_left" scale="0.001 0.001 0.001" file="hexapod_assets/left_servo_with_bracket_modi.stl" />
+    <mesh name="coxa_right" scale="0.001 0.001 0.001" file="hexapod_assets/right servo+bracket_modi.stl" />
+    <mesh name="femur" scale="0.001 0.001 0.001" file="hexapod_assets/Tibia.stl" />
+    <mesh name="tibia_left" scale="0.001 0.001 0.001" file="hexapod_assets/left_leg_with_servo.stl" />
+    <mesh name="tibia_right" scale="0.001 0.001 0.001" file="hexapod_assets/right_leg_with_servo.stl" />
+  </asset>
+  <default>
+    <joint limited="true" damping="0.06" stiffness="0" range="-90 90" armature="0.002" frictionloss="0.04" />
+  </default>
+  <worldbody>
+    <body name="lower">
+      <geom type="mesh" name="lower" mesh="lower" quat="0 0 0.707 0.707" pos="-0.01 0 0.075" mass="0.294" />
+      <freejoint />
+      <geom type="mesh" name="upper" mesh="upper" quat="0.00000000 0.00000000 0.70710678 0.70710678" pos="-0.01 0 0.142" mass="0.216" />
+      <body name="cx_1" pos="0.091 -0.0574 0.112" quat="0.92387953 0.00000000 0.00000000 0.38268343">
+        <geom type="mesh" name="coxa_left:1" mesh="coxa_left" euler="0 0 -90" mass="0.176" />
+        <joint name="coxa:1" type="hinge" pos="-0.005 0.0163 0.03" axis="0 0 1" range="-90 90" />
+        <body pos="0.02 -0.035 0.0212">
+          <geom type="mesh" name="femur_left:1" mesh="femur" euler="90 90 -45" mass="0.216" />
+          <joint name="femur:1" type="hinge" pos="0.003 0.021 -0.0145" axis="1 0 0" range="-90 90" />
+          <body pos="0.105 0.102 -0.086">
+            <geom type="mesh" name="tibia_left:1" mesh="tibia_left" euler="0 90 90" mass="0.085" />
+            <joint name="tibia:1" type="hinge" pos="-0.105 -0.1572 0.0717" axis="1 0 0" range="-90 90" />
+            <site name="touch:1" size="0.005" pos="-0.123 -0.1522 -0.042" rgba="1 1 1 0" />
+            <geom name="foot:1" type="sphere" size="0.004" pos="-0.123 -0.1522 -0.038" friction="1.5 0.02 0.001" rgba="0.15 0.15 0.15 1" contype="1" conaffinity="1" group="3" mass="0.005" />
+          </body>
+        </body>
+      </body>
+      <body name="cx_2" pos="-0.0052 -0.0842 0.112" quat="1.00000000 0.00000000 0.00000000 0.00000000">
+        <geom type="mesh" name="coxa_left:2" mesh="coxa_left" euler="0 0 -90" mass="0.176" />
+        <joint name="coxa:2" type="hinge" pos="-0.005 0.0163 0.03" axis="0 0 1" range="-90 90" />
+        <body pos="0.02 -0.035 0.0212">
+          <geom type="mesh" name="femur_left:2" mesh="femur" euler="90 90 -45" mass="0.216" />
+          <joint name="femur:2" type="hinge" pos="0.003 0.021 -0.0145" axis="1 0 0" range="-90 90" />
+          <body pos="0.105 0.102 -0.086">
+            <geom type="mesh" name="tibia_left:2" mesh="tibia_left" euler="0 90 90" mass="0.085" />
+            <joint name="tibia:2" type="hinge" pos="-0.105 -0.1572 0.0717" axis="1 0 0" range="-90 90" />
+            <site name="touch:2" size="0.005" pos="-0.123 -0.1522 -0.042" rgba="1 1 1 0" />
+            <geom name="foot:2" type="sphere" size="0.004" pos="-0.123 -0.1522 -0.038" friction="1.5 0.02 0.001" rgba="0.15 0.15 0.15 1" contype="1" conaffinity="1" group="3" mass="0.005" />
+          </body>
+        </body>
+      </body>
+      <body name="cx_3" pos="-0.1043 -0.0641 0.112" quat="0.92387953 0.00000000 0.00000000 -0.38268343">
+        <geom type="mesh" name="coxa_left:3" mesh="coxa_left" euler="0 0 -90" mass="0.176" />
+        <joint name="coxa:3" type="hinge" pos="-0.005 0.0163 0.03" axis="0 0 1" range="-90 90" />
+        <body pos="0.02 -0.035 0.0212">
+          <geom type="mesh" name="femur_left:3" mesh="femur" euler="90 90 -45" mass="0.216" />
+          <joint name="femur:3" type="hinge" pos="0.003 0.021 -0.0145" axis="1 0 0" range="-90 90" />
+          <body pos="0.105 0.102 -0.086">
+            <geom type="mesh" name="tibia_left:3" mesh="tibia_left" euler="0 90 90" mass="0.085" />
+            <joint name="tibia:3" type="hinge" pos="-0.105 -0.1572 0.0717" axis="1 0 0" range="-90 90" />
+            <site name="touch:3" size="0.005" pos="-0.123 -0.1522 -0.042" rgba="1 1 1 0" />
+            <geom name="foot:3" type="sphere" size="0.004" pos="-0.123 -0.1522 -0.038" friction="1.5 0.02 0.001" rgba="0.15 0.15 0.15 1" contype="1" conaffinity="1" group="3" mass="0.005" />
+          </body>
+        </body>
+      </body>
+      <body name="cx_4" pos="0.0867 0.0393 0.102" quat="0.92387953 0.00000000 0.00000000 -0.38268343">
+        <geom type="mesh" name="coxa_right:1" mesh="coxa_right" euler="0 0 -90" mass="0.176" />
+        <joint name="coxa:4" type="hinge" pos="-0.014 0.001 0.041" axis="0 0 1" range="-90 90" />
+        <body pos="0.01 0.0845 0.0315">
+          <geom type="mesh" name="femur_right:1" mesh="femur" euler="90 90 -45" mass="0.216" />
+          <joint name="femur:4" type="hinge" pos="0.003 -0.0552 -0.0145" axis="1 0 0" range="-90 90" />
+          <body pos="-0.072 0.1953 0.0873">
+            <geom type="mesh" name="tibia_right:1" mesh="tibia_right" euler="0 90 90" mass="0.085" />
+            <joint name="tibia:4" type="hinge" pos="0.075 -0.1742 -0.1018" axis="1 0 0" range="-90 90" />
+            <site name="touch:4" size="0.005" pos="0.055 -0.182 -0.216" rgba="1 1 1 0" />
+            <geom name="foot:4" type="sphere" size="0.004" pos="0.055 -0.182 -0.212" friction="1.5 0.02 0.001" rgba="0.15 0.15 0.15 1" contype="1" conaffinity="1" group="3" mass="0.005" />
+          </body>
+        </body>
+      </body>
+      <body name="cx_5" pos="0.0045 0.0685 0.102" quat="1.00000000 0.00000000 0.00000000 0.00000000">
+        <geom type="mesh" name="coxa_right:2" mesh="coxa_right" euler="0 0 -90" mass="0.176" />
+        <joint name="coxa:5" type="hinge" pos="-0.014 0.001 0.041" axis="0 0 1" range="-90 90" />
+        <body pos="0.01 0.0845 0.0315">
+          <geom type="mesh" name="femur_right:2" mesh="femur" euler="90 90 -45" mass="0.216" />
+          <joint name="femur:5" type="hinge" pos="0.003 -0.0552 -0.0145" axis="1 0 0" range="-90 90" />
+          <body pos="-0.072 0.1953 0.0873">
+            <geom type="mesh" name="tibia_right:2" mesh="tibia_right" euler="0 90 90" mass="0.085" />
+            <joint name="tibia:5" type="hinge" pos="0.075 -0.1742 -0.1018" axis="1 0 0" range="-90 90" />
+            <site name="touch:5" size="0.005" pos="0.055 -0.182 -0.216" rgba="1 1 1 0" />
+            <geom name="foot:5" type="sphere" size="0.004" pos="0.055 -0.182 -0.212" friction="1.5 0.02 0.001" rgba="0.15 0.15 0.15 1" contype="1" conaffinity="1" group="3" mass="0.005" />
+          </body>
+        </body>
+      </body>
+      <body name="cx_6" pos="-0.0863 0.0597 0.102" quat="0.92387953 0.00000000 0.00000000 0.38268343">
+        <geom type="mesh" name="coxa_right:3" mesh="coxa_right" euler="0 0 -90" mass="0.176" />
+        <joint name="coxa:6" type="hinge" pos="-0.014 0.001 0.041" axis="0 0 1" range="-90 90" />
+        <body pos="0.01 0.0845 0.0315">
+          <geom type="mesh" name="femur_right:3" mesh="femur" euler="90 90 -45" mass="0.216" />
+          <joint name="femur:6" type="hinge" pos="0.003 -0.0552 -0.0145" axis="1 0 0" range="-90 90" />
+          <body pos="-0.072 0.1953 0.0873">
+            <geom type="mesh" name="tibia_right:3" mesh="tibia_right" euler="0 90 90" mass="0.085" />
+            <joint name="tibia:6" type="hinge" pos="0.075 -0.1742 -0.1018" axis="1 0 0" range="-90 90" />
+            <site name="touch:6" size="0.005" pos="0.055 -0.182 -0.216" rgba="1 1 1 0" />
+            <geom name="foot:6" type="sphere" size="0.004" pos="0.055 -0.182 -0.212" friction="1.5 0.02 0.001" rgba="0.15 0.15 0.15 1" contype="1" conaffinity="1" group="3" mass="0.005" />
+          </body>
+        </body>
+      </body>
+      <camera name="eyeL" pos="0.075 -0.014 0.012" quat="-0.43938504 -0.36868783 0.52654078 0.62750687" fovy="90" />
+      <camera name="eyeR" pos="0.075 0.014 0.012" quat="0.62750687 0.52654078 -0.36868783 -0.43938504" fovy="90" />
+      <camera name="chase" mode="trackcom" pos="0.35 -0.35 0.25" xyaxes="0.707 0.707 0 -0.357 0.357 0.878" fovy="55" />
+    </body>
+    <light directional="true" pos="0 0 4" dir="0 0 -1" diffuse="0.55 0.55 0.55" specular="0.1 0.1 0.1" />
+    <geom name="floor" type="plane" size="3 3 0.05" contype="3" conaffinity="3" group="0" rgba="0.45 0.52 0.38 1" />
+    <geom name="wallN" type="box" pos="0  1.6 0.12" size="1.7 0.04 0.12" contype="3" conaffinity="3" group="2" rgba="0.5 0.5 0.55 1" />
+    <geom name="wallS" type="box" pos="0 -1.6 0.12" size="1.7 0.04 0.12" contype="3" conaffinity="3" group="2" rgba="0.5 0.5 0.55 1" />
+    <geom name="wallE" type="box" pos=" 1.6 0 0.12" size="0.04 1.7 0.12" contype="3" conaffinity="3" group="2" rgba="0.5 0.5 0.55 1" />
+    <geom name="wallW" type="box" pos="-1.6 0 0.12" size="0.04 1.7 0.12" contype="3" conaffinity="3" group="2" rgba="0.5 0.5 0.55 1" />
+    <geom name="rock1" type="box" pos="0.55  0.35 0.05" size="0.09 0.06 0.05" euler="0 0 28.6" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock2" type="cylinder" pos="0.85 -0.40 0.06" size="0.05 0.06 0.06" euler="0 0 63.0" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock3" type="box" pos="1.10  0.55 0.07" size="0.12 0.08 0.07" euler="0 0 -17.2" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock4" type="box" pos="0.30 -0.75 0.04" size="0.07 0.10 0.04" euler="0 0 51.6" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock5" type="cylinder" pos="-0.55 0.60 0.05" size="0.045 0.05 0.05" euler="0 0 11.5" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock6" type="box" pos="-0.90 -0.35 0.06" size="0.10 0.07 0.06" euler="0 0 -45.8" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock7" type="box" pos="-0.35 1.05 0.05" size="0.11 0.06 0.05" euler="0 0 80.2" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock8" type="cylinder" pos="0.05 0.75 0.07" size="0.06 0.07 0.07" euler="0 0 0" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock9" type="box" pos="-1.15 0.15 0.04" size="0.08 0.12 0.04" euler="0 0 22.9" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock10" type="cylinder" pos="-0.75 -0.95 0.06" size="0.055 0.06 0.06" euler="0 0 40.1" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock11" type="box" pos="0.70 1.15 0.06" size="0.10 0.09 0.06" euler="0 0 -57.3" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock12" type="box" pos="1.30 -0.10 0.05" size="0.06 0.11 0.05" euler="0 0 17.2" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock13" type="cylinder" pos="0.15 -1.20 0.05" size="0.05 0.05 0.05" euler="0 0 0" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <geom name="rock14" type="box" pos="-1.25 -0.75 0.07" size="0.09 0.08 0.07" euler="0 0 68.8" contype="3" conaffinity="3" group="2" rgba="0.62 0.58 0.50 1" />
+    <body name="goal" mocap="true" pos="0.8 0 0.004">
+      <geom name="goalpuck" type="cylinder" size="0.035 0.004" rgba="0.9 0.12 0.08 0.75" contype="0" conaffinity="0" group="4" />
+    </body>
+  </worldbody>
+  <sensor>
+    <touch name="touch_1" site="touch:1" />
+    <touch name="touch_2" site="touch:2" />
+    <touch name="touch_3" site="touch:3" />
+    <touch name="touch_4" site="touch:4" />
+    <touch name="touch_5" site="touch:5" />
+    <touch name="touch_6" site="touch:6" />
+  </sensor>
+  <actuator>
+    <position name="coxa_1" kp="40" joint="coxa:1" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="coxa_2" kp="40" joint="coxa:2" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="coxa_3" kp="40" joint="coxa:3" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="coxa_4" kp="40" joint="coxa:4" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="coxa_5" kp="40" joint="coxa:5" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="coxa_6" kp="40" joint="coxa:6" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="femur_1" kp="40" joint="femur:1" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="femur_2" kp="40" joint="femur:2" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="femur_3" kp="40" joint="femur:3" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="femur_4" kp="40" joint="femur:4" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="femur_5" kp="40" joint="femur:5" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="femur_6" kp="40" joint="femur:6" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="tibia_1" kp="40" joint="tibia:1" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="tibia_2" kp="40" joint="tibia:2" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="tibia_3" kp="40" joint="tibia:3" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="tibia_4" kp="40" joint="tibia:4" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="tibia_5" kp="40" joint="tibia:5" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+    <position name="tibia_6" kp="40" joint="tibia:6" kv="0.6" forcerange="-8 8" ctrlrange="-1.5708 1.5708" ctrllimited="true" />
+  </actuator>
+  <keyframe>
+    <key name="home" qpos="0.000000 0.000000 0.020874 1.000000 0.000000 0.000000 0.000000 0.000000 0.349066 -0.349066 0.000000 0.349066 -0.349066 0.000000 0.349066 -0.349066 0.000000 0.349066 -0.349066 0.000000 0.349066 -0.349066 0.000000 0.349066 -0.349066" />
+  </keyframe>
+</mujoco>
